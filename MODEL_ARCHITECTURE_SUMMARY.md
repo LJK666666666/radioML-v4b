@@ -121,6 +121,15 @@ from models import (..., build_dae_model, ...)
 
 ## Testing
 
+### DAE Model Fixes
+
+**Issue Fixed**: DAE model was missing `model.compile()` call, causing "You must call `compile()` before using the model" error during training.
+
+**Solution Applied**:
+1. Added compilation to `build_dae_model()` with dual-output loss configuration
+2. Optimized `build_dae_model_classifier_only()` to build only classification branch directly
+3. Both versions now compile automatically with appropriate loss functions and metrics
+
 To test the models:
 
 ```bash
@@ -138,7 +147,7 @@ y = model.predict(x, verbose=0)
 print(f'Input: {x.shape}, Output: {y.shape}')
 "
 
-# Test DAE
+# Test DAE (classifier-only version)
 python -c "
 from model.dae_model import build_dae_model_classifier_only
 import numpy as np
@@ -149,6 +158,23 @@ model.summary()
 x = np.random.randn(4, 2, 128).astype('float32')
 y = model.predict(x, verbose=0)
 print(f'Input: {x.shape}, Output: {y.shape}')
+print('✓ DAE model compiles and runs successfully!')
+"
+
+# Test DAE (dual-output version)
+python -c "
+from model.dae_model import build_dae_model
+import numpy as np
+
+model = build_dae_model((2, 128), 11)
+model.summary()
+
+x = np.random.randn(4, 2, 128).astype('float32')
+outputs = model.predict(x, verbose=0)
+print(f'Input: {x.shape}')
+print(f'Classification output: {outputs[0].shape}')
+print(f'Reconstruction output: {outputs[1].shape}')
+print('✓ Dual-output DAE model compiles and runs successfully!')
 "
 ```
 

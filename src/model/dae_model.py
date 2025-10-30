@@ -90,6 +90,18 @@ def build_dae_model(input_shape=(2, 128), num_classes=11, use_gpu_lstm=True):
     # Create model with dual outputs
     model = Model(inputs=inputs, outputs=[xc, xd], name='DAE')
 
+    # Compile model
+    # Loss weights: prioritize classification over reconstruction
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss={
+            'xc': 'categorical_crossentropy',
+            'xd': 'mse'  # Mean squared error for reconstruction
+        },
+        loss_weights={'xc': 1.0, 'xd': 0.5},  # Classification more important
+        metrics={'xc': 'accuracy'}
+    )
+
     return model
 
 
@@ -108,14 +120,62 @@ def build_dae_model_classifier_only(input_shape=(2, 128), num_classes=11, use_gp
     Returns:
         Keras Model with single classification output
     """
-    # Build full model
-    full_model = build_dae_model(input_shape, num_classes, use_gpu_lstm)
+    # Input shape needs to be transposed for LSTM
+    # PyTorch/Original: (2, 128) -> need to transpose to (128, 2) for LSTM
+    # LSTM expects (time_steps, features)
+    if input_shape == (2, 128):
+        # Need to handle transpose
+        inputs = Input(shape=input_shape, name='input')
+        # Transpose from (2, 128) to (128, 2)
+        x = tf.keras.layers.Permute((2, 1))(inputs)  # (batch, 2, 128) -> (batch, 128, 2)
+    else:
+        # Already in correct format (128, 2)
+        inputs = Input(shape=input_shape, name='input')
+        x = inputs
 
-    # Extract only the classification output
-    model = Model(
-        inputs=full_model.input,
-        outputs=full_model.get_layer('xc').output,
-        name='DAE_Classifier'
+    # Dropout rate
+    dr = 0.0  # Set to 0 as in original
+
+    # LSTM Unit 1: 32 units, return sequences and states
+    # CuDNNLSTM equivalent: use activation='tanh', recurrent_activation='sigmoid'
+    lstm_kwargs = {
+        'units': 32,
+        'return_state': True,
+        'return_sequences': True
+    }
+
+    if use_gpu_lstm:
+        # Standard LSTM with settings that match CuDNNLSTM behavior
+        lstm_kwargs.update({
+            'activation': 'tanh',
+            'recurrent_activation': 'sigmoid',
+            'use_bias': True,
+            'recurrent_dropout': 0.0
+        })
+
+    x, s, c = LSTM(**lstm_kwargs)(x)
+    x = Dropout(dr)(x)
+
+    # LSTM Unit 2: 32 units, return sequences and states
+    x, s1, c1 = LSTM(**lstm_kwargs)(x)
+
+    # Classifier branch (uses final state s1)
+    xc = Dense(32, activation='relu')(s1)
+    xc = BatchNormalization()(xc)
+    xc = Dropout(dr)(xc)
+    xc = Dense(16, activation='relu')(xc)
+    xc = BatchNormalization()(xc)
+    xc = Dropout(dr)(xc)
+    outputs = Dense(num_classes, activation='softmax', name='classification')(xc)
+
+    # Create model with single classification output
+    model = Model(inputs=inputs, outputs=outputs, name='DAE_Classifier')
+
+    # Compile model
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
     )
 
     return model
