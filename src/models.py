@@ -19,6 +19,7 @@ from model.ulcnn_model import build_ulcnn_model
 # Import benchmark models
 from model.cldnn_model import build_cldnn_model_adapted as build_cldnn_model
 from model.cgdnn_model import build_cgdnn_model_adapted as build_cgdnn_model
+from model.dae_model import build_dae_model_classifier_only as build_dae_model
 
 # Import G-PET model (PET with learnable GPR denoising)
 from model.g_pet_model import build_gpet_model, build_gpet_lightweight_model

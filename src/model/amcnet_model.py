@@ -329,8 +329,10 @@ class FeaFusionModule(tf.keras.layers.Layer):
 
         context = tf.matmul(attention_probs, value_heads)
 
-        # Reshape back: [batch_size, num_heads, num_channels, head_size] -> [batch_size, num_heads*num_channels, head_size]
-        # This matches PyTorch: context.contiguous().view(shape[0], -1, shape[-1])
+        # Reshape back: [batch_size, num_heads, num_channels, head_size] -> [batch_size, num_channels, num_heads*head_size]
+        # This matches PyTorch line 143-144: shape = context.size() then context.view(shape[0], -1, shape[-1])
+        # PyTorch context.size() = [batch, num_heads, num_channels, head_size]
+        # view(shape[0], -1, shape[-1]) = view(batch, num_heads*num_channels, head_size)
         batch_size = tf.shape(context)[0]
         num_channels = tf.shape(context)[2]
         head_size = tf.shape(context)[3]
@@ -368,16 +370,17 @@ def build_amcnet_model(input_shape, num_classes=11, sig_len=128, extend_channel=
     # Input: (batch, 2, W) exactly like PyTorch
     inputs = Input(shape=input_shape, name='input_signals')
 
-    # PyTorch: x.unsqueeze(1) -> (batch, 1, 2, W)
-    # TensorFlow equivalent: (batch, 2, W) -> (batch, 2, W, 1)
+    # PyTorch: x.unsqueeze(1) on (batch, 2, W) -> (batch, 1, 2, W)
+    # TensorFlow channels_last equivalent: (batch, 2, W) -> (batch, 2, W, 1)
+    # This represents: batch, height=2 (I/Q), width=W, channels=1
     x = Reshape((input_shape[0], input_shape[1], 1))(inputs)  # (batch, 2, W, 1)
 
     # AdaCorrModule - operates on (batch, 2, W, 1)
     x = AdaCorrModule(sig_len)(x)
 
-    # L2 normalization along width dimension (matching PyTorch commented line)
+    # L2 normalization along width dimension (matching PyTorch line 193)
     # PyTorch: x = x / x.norm(p=2, dim=-1, keepdim=True)  # dim=-1 is width
-    # x = L2NormalizeWidthLayer()(x)  # axis=2 is width dimension
+    x = L2NormalizeWidthLayer()(x)  # axis=2 is width dimension
 
     # MultiScaleModule - input: (batch, 2, W, 1), treats 2 as height, 1 as in_channels
     x = MultiScaleModule(extend_channel)(x)  # output: (batch, 1, W, 36)

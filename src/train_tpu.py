@@ -18,23 +18,35 @@ def configure_tpu():
         resolver: TPU cluster resolver if TPU is available, else None
     """
     try:
-        # Try to detect TPU
-        resolver = tf.distribute.cluster_resolver.TPUClusterResolver.connect()
-        print(f"TPU detected: {resolver.master()}")
+        # Method 1: Try to detect TPU using environment variable or automatic detection
+        tpu_address = os.environ.get('TPU_NAME', None)
+
+        if tpu_address:
+            print(f"TPU_NAME environment variable found: {tpu_address}")
+            resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu=tpu_address)
+        else:
+            # Try automatic detection
+            print("Attempting automatic TPU detection...")
+            resolver = tf.distribute.cluster_resolver.TPUClusterResolver()
+
+        print(f"Connecting to TPU at: {resolver.master()}")
+        tf.config.experimental_connect_to_cluster(resolver)
 
         # Initialize TPU system
+        print("Initializing TPU system...")
         tf.tpu.experimental.initialize_tpu_system(resolver)
 
         # Create TPU distribution strategy
         tpu_strategy = tf.distribute.TPUStrategy(resolver)
 
-        print(f"TPU initialized successfully")
-        print(f"Number of replicas: {tpu_strategy.num_replicas_in_sync}")
+        print(f"TPU initialized successfully!")
+        print(f"TPU master: {resolver.master()}")
+        print(f"Number of TPU cores (replicas): {tpu_strategy.num_replicas_in_sync}")
 
         return tpu_strategy, resolver
 
-    except (ValueError, tf.errors.NotFoundError, tf.errors.InvalidArgumentError) as e:
-        print(f"TPU not found or initialization failed: {e}")
+    except Exception as e:
+        print(f"TPU initialization failed: {type(e).__name__}: {e}")
         print("Falling back to default strategy (CPU/GPU)")
         return None, None
 
