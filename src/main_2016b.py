@@ -29,7 +29,7 @@ from models import (
     # AMC-Net model
     build_amcnet_model,
     # Benchmark models
-    build_cldnn_model, build_cgdnn_model,
+    build_cldnn_model, build_cgdnn_model, build_dae_model,
     # ULCNN models
     build_mcldnn_model, build_scnn_model, build_mcnet_model, build_pet_model, build_ulcnn_model,
     # New ultra-lightweight hybrid models
@@ -364,7 +364,7 @@ def get_available_models():
         # AMC-Net model
         'amcnet',
         # Benchmark models
-        'cldnn', 'cgdnn',
+        'cldnn', 'cgdnn', 'dae',
         # ULCNN models
         'mcldnn', 'scnn', 'mcnet', 'pet', 'ulcnn',
         # New ultra-lightweight hybrid models
@@ -399,6 +399,7 @@ def build_model_by_name(model_name, input_shape, num_classes):
         # Benchmark models
         'cldnn': build_cldnn_model,
         'cgdnn': build_cgdnn_model,
+        'dae': build_dae_model,
         # ULCNN models
         'mcldnn': build_mcldnn_model,
         'scnn': build_scnn_model,
