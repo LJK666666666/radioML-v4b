@@ -2,7 +2,8 @@
 
 from keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 
-def get_callbacks(checkpoint_path, patience_lr=2, patience_es=30):
+# def get_callbacks(checkpoint_path, patience_lr=2, patience_es=30):
+def get_callbacks(checkpoint_path, patience_lr=2, patience_es=20):
     """
     Prepare callbacks for model training.
     
