@@ -45,3 +45,4 @@ presentation/
 AMC-Net/
 AMR-Benchmark/
 
+*.keras
