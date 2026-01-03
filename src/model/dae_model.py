@@ -2,24 +2,61 @@
 DAE (Denoising Autoencoder) Model for RadioML
 Based on: AMR-Benchmark/RML201610a/DAE/rmlmodels/DAE.py
 
-Architecture:
-- Input: (128, 2) - time steps x features (I/Q)
-- 2x LSTM layers (32 units each)
-- Classifier branch: Dense layers -> softmax
-- Decoder branch: TimeDistributed Dense -> reconstructed signal
+Architecture parity with legacy script LSTMDAE/201610A/DAELSTM.py:
+- Input to LSTM is (128, 2) i.e., time steps x features
+- Two stacked LSTMs with 32 units each (return_sequences=True, return_state=True)
+- Classification head from final hidden state: 32 -> BN -> Dropout(0) -> 16 -> BN -> Dropout(0) -> num_classes -> Softmax
+- Decoder head from sequence output: TimeDistributed(Dense(2))
+- Output order is [decoder(reconstruction), softmax(classification)] to match DAELSTM.py
+- Compile config mirrors DAELSTM.py defaults: Adam(lr=1e-2), losses [mse, categorical_crossentropy],
+  loss_weights [0.9(recon), 0.1(cls)] with metrics on classification
 
-Reference: AMR-Benchmark implementation
+Note on preprocessing:
+The legacy script converts I/Q -> [amplitude, phase] and L2-normalizes the amplitude channel per sample
+before feeding the model. You can enable the same preprocessing inside the model by setting
+`integrate_preprocessing=True` in `build_dae_model`; or use the helper `iq_to_amp_phase` below in your
+input pipeline if you prefer external preprocessing.
 """
 
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
     Input, Dense, LSTM, Dropout, BatchNormalization,
-    TimeDistributed, Reshape
+    TimeDistributed, Lambda
 )
 
+import numpy as np
 
-def build_dae_model(input_shape=(2, 128), num_classes=11, use_gpu_lstm=True):
+
+def iq_to_amp_phase(x: np.ndarray) -> np.ndarray:
+    """
+    Convert I/Q input to amplitude/phase with amplitude L2-normalization per sample.
+
+    Args:
+        x: numpy array of shape (N, 2, 128) where x[:, 0, :] = I, x[:, 1, :] = Q
+
+    Returns:
+        numpy array of shape (N, 128, 2) where [:, :, 0] = normalized amplitude,
+        [:, :, 1] = phase/π, ready to feed LSTM expecting (time, features)
+    """
+    assert x.ndim == 3 and x.shape[1] == 2, "Input must be (N, 2, 128)"
+    signal_len = x.shape[2]
+    cmplx = x[:, 0, :] + 1j * x[:, 1, :]
+    amp = np.abs(cmplx)
+    ang = np.arctan2(x[:, 1, :], x[:, 0, :]) / np.pi
+    amp = amp.reshape(-1, 1, signal_len)
+    ang = ang.reshape(-1, 1, signal_len)
+    out = np.concatenate([amp, ang], axis=1)  # (N, 2, T)
+    out = np.transpose(out, (0, 2, 1))        # (N, T, 2)
+    # L2-normalize amplitude channel per sample
+    for i in range(out.shape[0]):
+        norm = np.linalg.norm(out[i, :, 0], ord=2)
+        if norm > 0:
+            out[i, :, 0] = out[i, :, 0] / norm
+    return out.astype(np.float32)
+
+
+def build_dae_model(input_shape=(2, 128), num_classes=11, use_gpu_lstm=True, integrate_preprocessing=False):
     """
     Build DAE model for automatic modulation classification.
 
@@ -30,24 +67,49 @@ def build_dae_model(input_shape=(2, 128), num_classes=11, use_gpu_lstm=True):
                      If False, uses standard LSTM
 
     Returns:
-        Keras Model with dual outputs: (classification, reconstruction)
+        Keras Model with dual outputs: (reconstruction, classification)
 
     Note:
         The original model uses CuDNNLSTM which is deprecated. We use standard LSTM
         with activation='tanh', recurrent_activation='sigmoid' to match CuDNNLSTM behavior.
     """
-    # Input shape needs to be transposed for LSTM
-    # PyTorch/Original: (2, 128) -> need to transpose to (128, 2) for LSTM
-    # LSTM expects (time_steps, features)
-    if input_shape == (2, 128):
-        # Need to handle transpose
-        inputs = Input(shape=input_shape, name='input')
-        # Transpose from (2, 128) to (128, 2)
-        x = tf.keras.layers.Permute((2, 1))(inputs)  # (batch, 2, 128) -> (batch, 128, 2)
+    # Input shape and optional integrated preprocessing (I/Q -> amp/phase + L2-normalize amplitude)
+    inputs = Input(shape=input_shape, name='input')
+    if integrate_preprocessing:
+        eps = 1e-8
+        if input_shape == (2, 128):
+            # channels-first over time: (B, 2, 128)
+            def _preproc(t):
+                i = t[:, 0, :]  # (B, 128)
+                q = t[:, 1, :]
+                amp = tf.sqrt(tf.square(i) + tf.square(q))
+                ang = tf.math.atan2(q, i) / tf.constant(np.pi, dtype=t.dtype)
+                norm = tf.sqrt(tf.reduce_sum(tf.square(amp), axis=-1, keepdims=True)) + eps
+                amp = amp / norm
+                out = tf.stack([amp, ang], axis=-1)  # (B, 128, 2)
+                return out
+            x = Lambda(_preproc, name='iq_to_amp_phase_layer')(inputs)
+        elif input_shape == (128, 2):
+            # time-major, channels-last: (B, 128, 2)
+            def _preproc(t):
+                i = t[:, :, 0]
+                q = t[:, :, 1]
+                amp = tf.sqrt(tf.square(i) + tf.square(q))
+                ang = tf.math.atan2(q, i) / tf.constant(np.pi, dtype=t.dtype)
+                norm = tf.sqrt(tf.reduce_sum(tf.square(amp), axis=-1, keepdims=True)) + eps
+                amp = amp / norm
+                out = tf.stack([amp, ang], axis=-1)  # (B, 128, 2)
+                return out
+            x = Lambda(_preproc, name='iq_to_amp_phase_layer')(inputs)
+        else:
+            # Fallback: assume already (time, features)
+            x = inputs
     else:
-        # Already in correct format (128, 2)
-        inputs = Input(shape=input_shape, name='input')
-        x = inputs
+        # No preprocessing: ensure shape (time, features) for LSTM
+        if input_shape == (2, 128):
+            x = tf.keras.layers.Permute((2, 1), name='to_time_major')(inputs)  # (B, 128, 2)
+        else:
+            x = inputs  # already (128, 2)
 
     # Dropout rate
     dr = 0.0  # Set to 0 as in original
@@ -69,43 +131,43 @@ def build_dae_model(input_shape=(2, 128), num_classes=11, use_gpu_lstm=True):
             'recurrent_dropout': 0.0
         })
 
-    x, s, c = LSTM(**lstm_kwargs)(x)
-    x = Dropout(dr)(x)
+    x, s, c = LSTM(**lstm_kwargs, name='encoder_1')(x)
+    x = Dropout(dr, name='drop_1')(x)
 
     # LSTM Unit 2: 32 units, return sequences and states
-    x, s1, c1 = LSTM(**lstm_kwargs)(x)
+    x, s1, c1 = LSTM(**lstm_kwargs, name='encoder_2')(x)
 
     # Classifier branch (uses final state s1)
-    xc = Dense(32, activation='relu')(s1)
-    xc = BatchNormalization()(xc)
-    xc = Dropout(dr)(xc)
-    xc = Dense(16, activation='relu')(xc)
-    xc = BatchNormalization()(xc)
-    xc = Dropout(dr)(xc)
-    xc = Dense(num_classes, activation='softmax', name='xc')(xc)
+    xc = Dense(32, activation='relu', name='clf_dense_1')(s1)
+    xc = BatchNormalization(name='bn_1')(xc)
+    xc = Dropout(dr, name='clf_drop_1')(xc)
+    xc = Dense(16, activation='relu', name='clf_dense_2')(xc)
+    xc = BatchNormalization(name='bn_2')(xc)
+    xc = Dropout(dr, name='clf_drop_2')(xc)
+    softmax = Dense(num_classes, activation='softmax', name='softmax')(xc)
 
     # Decoder branch (uses full sequence x)
-    xd = TimeDistributed(Dense(2), name='xd')(x)
+    decoder = TimeDistributed(Dense(2), name='decoder')(x)
 
-    # Create model with dual outputs
-    model = Model(inputs=inputs, outputs=[xc, xd], name='DAE')
+    # Create model with dual outputs (order aligned with legacy: [decoder, softmax])
+    model = Model(inputs=inputs, outputs=[decoder, softmax], name='DAE')
 
-    # Compile model
-    # Loss weights: prioritize classification over reconstruction
+    # Compile model (mirror DAELSTM.py): lr=1e-2, losses [mse, categorical_crossentropy],
+    # loss_weights = [0.9, 0.1] with metrics on classification only
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-2),
         loss={
-            'xc': 'categorical_crossentropy',
-            'xd': 'mse'  # Mean squared error for reconstruction
+            'decoder': 'mse',
+            'softmax': 'categorical_crossentropy'
         },
-        loss_weights={'xc': 1.0, 'xd': 0.5},  # Classification more important
-        metrics={'xc': 'accuracy'}
+        loss_weights={'decoder': 0.9, 'softmax': 0.1},
+        metrics={'softmax': 'accuracy'}
     )
 
     return model
 
 
-def build_dae_model_classifier_only(input_shape=(2, 128), num_classes=11, use_gpu_lstm=True):
+def build_dae_model_classifier_only(input_shape=(2, 128), num_classes=11, use_gpu_lstm=True, integrate_preprocessing=False):
     """
     Build DAE model for classification only (no reconstruction output).
 
@@ -116,22 +178,49 @@ def build_dae_model_classifier_only(input_shape=(2, 128), num_classes=11, use_gp
         input_shape: Input shape (channels, time_steps) = (2, 128) for I/Q data
         num_classes: Number of modulation classes
         use_gpu_lstm: Whether to use GPU-optimized LSTM
+        integrate_preprocessing: If True, apply I/Q -> (amp, phase/pi) conversion
+            with per-sample L2 normalization on amplitude inside the model.
 
     Returns:
         Keras Model with single classification output
     """
-    # Input shape needs to be transposed for LSTM
-    # PyTorch/Original: (2, 128) -> need to transpose to (128, 2) for LSTM
-    # LSTM expects (time_steps, features)
-    if input_shape == (2, 128):
-        # Need to handle transpose
-        inputs = Input(shape=input_shape, name='input')
-        # Transpose from (2, 128) to (128, 2)
-        x = tf.keras.layers.Permute((2, 1))(inputs)  # (batch, 2, 128) -> (batch, 128, 2)
+    # Input shape and optional integrated preprocessing
+    inputs = Input(shape=input_shape, name='input')
+    if integrate_preprocessing:
+        eps = 1e-8
+        if input_shape == (2, 128):
+            # (B, 2, 128) channels-first over time
+            def _preproc(t):
+                i = t[:, 0, :]
+                q = t[:, 1, :]
+                amp = tf.sqrt(tf.square(i) + tf.square(q))
+                ang = tf.math.atan2(q, i) / tf.constant(np.pi, dtype=t.dtype)
+                norm = tf.sqrt(tf.reduce_sum(tf.square(amp), axis=-1, keepdims=True)) + eps
+                amp = amp / norm
+                out = tf.stack([amp, ang], axis=-1)  # (B, 128, 2)
+                return out
+            x = tf.keras.layers.Lambda(_preproc, name='iq_to_amp_phase_layer')(inputs)
+        elif input_shape == (128, 2):
+            # (B, 128, 2) time-major, channels-last
+            def _preproc(t):
+                i = t[:, :, 0]
+                q = t[:, :, 1]
+                amp = tf.sqrt(tf.square(i) + tf.square(q))
+                ang = tf.math.atan2(q, i) / tf.constant(np.pi, dtype=t.dtype)
+                norm = tf.sqrt(tf.reduce_sum(tf.square(amp), axis=-1, keepdims=True)) + eps
+                amp = amp / norm
+                out = tf.stack([amp, ang], axis=-1)  # (B, 128, 2)
+                return out
+            x = tf.keras.layers.Lambda(_preproc, name='iq_to_amp_phase_layer')(inputs)
+        else:
+            # Fallback: assume already (time, features)
+            x = inputs
     else:
-        # Already in correct format (128, 2)
-        inputs = Input(shape=input_shape, name='input')
-        x = inputs
+        # No preprocessing: ensure shape (time, features) for LSTM
+        if input_shape == (2, 128):
+            x = tf.keras.layers.Permute((2, 1), name='to_time_major')(inputs)  # (B, 128, 2)
+        else:
+            x = inputs
 
     # Dropout rate
     dr = 0.0  # Set to 0 as in original
@@ -153,27 +242,27 @@ def build_dae_model_classifier_only(input_shape=(2, 128), num_classes=11, use_gp
             'recurrent_dropout': 0.0
         })
 
-    x, s, c = LSTM(**lstm_kwargs)(x)
-    x = Dropout(dr)(x)
+    x, s, c = LSTM(**lstm_kwargs, name='encoder_1')(x)
+    x = Dropout(dr, name='drop_1')(x)
 
     # LSTM Unit 2: 32 units, return sequences and states
-    x, s1, c1 = LSTM(**lstm_kwargs)(x)
+    x, s1, c1 = LSTM(**lstm_kwargs, name='encoder_2')(x)
 
     # Classifier branch (uses final state s1)
-    xc = Dense(32, activation='relu')(s1)
-    xc = BatchNormalization()(xc)
-    xc = Dropout(dr)(xc)
-    xc = Dense(16, activation='relu')(xc)
-    xc = BatchNormalization()(xc)
-    xc = Dropout(dr)(xc)
-    outputs = Dense(num_classes, activation='softmax', name='classification')(xc)
+    xc = Dense(32, activation='relu', name='clf_dense_1')(s1)
+    xc = BatchNormalization(name='bn_1')(xc)
+    xc = Dropout(dr, name='clf_drop_1')(xc)
+    xc = Dense(16, activation='relu', name='clf_dense_2')(xc)
+    xc = BatchNormalization(name='bn_2')(xc)
+    xc = Dropout(dr, name='clf_drop_2')(xc)
+    outputs = Dense(num_classes, activation='softmax', name='softmax')(xc)
 
     # Create model with single classification output
     model = Model(inputs=inputs, outputs=outputs, name='DAE_Classifier')
 
     # Compile model
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-2),
         loss='categorical_crossentropy',
         metrics=['accuracy']
     )
@@ -196,8 +285,8 @@ if __name__ == '__main__':
     x = np.random.randn(4, 2, 128).astype(np.float32)
     print(f"\nInput shape: {x.shape}")
     outputs = model.predict(x, verbose=0)
-    print(f"Classification output shape: {outputs[0].shape}")
-    print(f"Reconstruction output shape: {outputs[1].shape}")
+    print(f"Reconstruction output shape: {outputs[0].shape}")
+    print(f"Classification output shape: {outputs[1].shape}")
 
     # Test classifier-only version
     print("\n2. Testing classifier-only version...")
