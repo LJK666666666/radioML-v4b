@@ -16,6 +16,7 @@ import time
 import random
 import numpy as np
 import tensorflow as tf
+import torch
 
 # Suppress TensorFlow warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 0=all logs, 1=filter INFO, 2=filter WARNING, 3=filter ERROR
@@ -24,7 +25,7 @@ tf.get_logger().setLevel('ERROR')
 # Import project modules
 from explore_dataset import load_radioml_data, explore_dataset, plot_signal_examples
 from preprocess import prepare_data_by_snr_stratified
-from train import train_model, plot_training_history
+from train import train_model, train_torch_model, plot_training_history
 from models import (
     build_cnn1d_model, build_cnn2d_model, build_resnet_model, build_complex_nn_model,
     get_callbacks,
@@ -36,9 +37,11 @@ from models import (
     # ULCNN models
     build_mcldnn_model, build_scnn_model, build_mcnet_model, build_pet_model, build_ulcnn_model,
     # New ultra-lightweight hybrid models
-    build_ultra_lightweight_hybrid_model, build_micro_lightweight_hybrid_model
+    build_ultra_lightweight_hybrid_model, build_micro_lightweight_hybrid_model,
+    # PyTorch models
+    build_iqformer_model, build_fea_t_model
 )
-from evaluate import evaluate_by_snr
+from evaluate import evaluate_by_snr, evaluate_torch_by_snr
 from model.custom_objects import get_custom_objects_for_model
 
 
@@ -179,7 +182,9 @@ def get_available_models():
         # ULCNN models
         'mcldnn', 'scnn', 'mcnet', 'pet', 'ulcnn',
         # New ultra-lightweight hybrid models
-        'ultra_lightweight_hybrid', 'micro_lightweight_hybrid'
+        'ultra_lightweight_hybrid', 'micro_lightweight_hybrid',
+        # PyTorch models
+        'iqformer', 'fea_t'
     ]
 
 
@@ -217,12 +222,20 @@ def build_model_by_name(model_name, input_shape, num_classes):
         # New ultra-lightweight hybrid models
         'ultra_lightweight_hybrid': build_ultra_lightweight_hybrid_model,
         'micro_lightweight_hybrid': build_micro_lightweight_hybrid_model,
+        # PyTorch models
+        'iqformer': build_iqformer_model,
+        'fea_t': build_fea_t_model,
     }
 
     if model_name in model_builders:
         return model_builders[model_name](input_shape, num_classes)
     else:
         raise ValueError(f"Unknown model name: {model_name}")
+
+
+def is_torch_model_name(model_name):
+    """Whether the model is trained/evaluated with PyTorch pipeline."""
+    return model_name in {'iqformer', 'fea_t'}
 
 
 def validate_model_selection(selected_models):
@@ -264,17 +277,34 @@ def train_selected_models(selected_models, X_train, y_train, X_val, y_val, input
             model = build_model_by_name(model_name, input_shape, num_classes)
 
             print(f"Model architecture for {model_name}:")
-            model.summary()
+            if is_torch_model_name(model_name):
+                total_params = sum(p.numel() for p in model.parameters())
+                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                print(model)
+                print(f"Total parameters: {total_params:,}")
+                print(f"Trainable parameters: {trainable_params:,}")
+            else:
+                model.summary()
 
             # Train model
-            history = train_model(
-                model,
-                X_train_model, y_train,
-                X_val_model, y_val,
-                os.path.join(models_dir, f"{model_name}_model{suffix}.keras"),
-                batch_size=batch_size,
-                epochs=epochs
-            )
+            if is_torch_model_name(model_name):
+                history = train_torch_model(
+                    model,
+                    X_train_model, y_train,
+                    X_val_model, y_val,
+                    os.path.join(models_dir, f"{model_name}_model{suffix}.pt"),
+                    batch_size=batch_size,
+                    epochs=epochs
+                )
+            else:
+                history = train_model(
+                    model,
+                    X_train_model, y_train,
+                    X_val_model, y_val,
+                    os.path.join(models_dir, f"{model_name}_model{suffix}.keras"),
+                    batch_size=batch_size,
+                    epochs=epochs
+                )
 
             # Plot and save training history
             plot_training_history(
@@ -290,7 +320,7 @@ def train_selected_models(selected_models, X_train, y_train, X_val, y_val, input
 
 
 def evaluate_model_variants(model_name, model_base_path, X_test, y_test, snr_test, mods,
-                            results_dir, suffix="", custom_objects=None):
+                            results_dir, input_shape, num_classes, suffix="", custom_objects=None):
     """Evaluate both the best model and the last epoch model for a given model type.
 
     Args:
@@ -301,41 +331,68 @@ def evaluate_model_variants(model_name, model_base_path, X_test, y_test, snr_tes
         suffix: File suffix for distinguishing configurations
         custom_objects: Custom objects needed for model loading (optional)
     """
-    # Standard Keras model evaluation
-    best_model_path = model_base_path + ".keras"
+    # Standard Keras/PyTorch model evaluation
+    model_ext = ".pt" if is_torch_model_name(model_name) else ".keras"
+    best_model_path = model_base_path + model_ext
     if os.path.exists(best_model_path):
         print(f"\nEvaluating {model_name} Model (Best)...")
         try:
-            if custom_objects:
-                best_model = tf.keras.models.load_model(best_model_path, custom_objects=custom_objects)
+            if is_torch_model_name(model_name):
+                best_model = build_model_by_name(model_name, input_shape, num_classes)
+                checkpoint = torch.load(best_model_path, map_location="cpu")
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    best_model.load_state_dict(checkpoint['model_state_dict'])
+                else:
+                    best_model.load_state_dict(checkpoint)
+                evaluate_torch_by_snr(
+                    best_model,
+                    X_test, y_test, snr_test, mods,
+                    os.path.join(results_dir, f'{model_name}_evaluation_results{suffix}')
+                )
             else:
-                best_model = tf.keras.models.load_model(best_model_path)
+                if custom_objects:
+                    best_model = tf.keras.models.load_model(best_model_path, custom_objects=custom_objects)
+                else:
+                    best_model = tf.keras.models.load_model(best_model_path)
+                evaluate_by_snr(
+                    best_model,
+                    X_test, y_test, snr_test, mods,
+                    os.path.join(results_dir, f'{model_name}_evaluation_results{suffix}')
+                )
             print(f"Successfully loaded best model from {best_model_path}")
-            evaluate_by_snr(
-                best_model,
-                X_test, y_test, snr_test, mods,
-                os.path.join(results_dir, f'{model_name}_evaluation_results{suffix}')
-            )
         except Exception as e:
             print(f"Error loading or evaluating best model {best_model_path}: {e}")
     else:
         print(f"Best model {best_model_path} not found for evaluation.")
 
     # Evaluate last epoch model
-    last_model_path = model_base_path + "_last.keras"
+    last_model_path = model_base_path + "_last" + model_ext
     if os.path.exists(last_model_path):
         print(f"\nEvaluating {model_name} Model (Last Epoch)...")
         try:
-            if custom_objects:
-                last_model = tf.keras.models.load_model(last_model_path, custom_objects=custom_objects)
+            if is_torch_model_name(model_name):
+                last_model = build_model_by_name(model_name, input_shape, num_classes)
+                checkpoint = torch.load(last_model_path, map_location="cpu")
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    last_model.load_state_dict(checkpoint['model_state_dict'])
+                else:
+                    last_model.load_state_dict(checkpoint)
+                evaluate_torch_by_snr(
+                    last_model,
+                    X_test, y_test, snr_test, mods,
+                    os.path.join(results_dir, f'{model_name}_evaluation_results_last{suffix}')
+                )
             else:
-                last_model = tf.keras.models.load_model(last_model_path)
+                if custom_objects:
+                    last_model = tf.keras.models.load_model(last_model_path, custom_objects=custom_objects)
+                else:
+                    last_model = tf.keras.models.load_model(last_model_path)
+                evaluate_by_snr(
+                    last_model,
+                    X_test, y_test, snr_test, mods,
+                    os.path.join(results_dir, f'{model_name}_evaluation_results_last{suffix}')
+                )
             print(f"Successfully loaded last epoch model from {last_model_path}")
-            evaluate_by_snr(
-                last_model,
-                X_test, y_test, snr_test, mods,
-                os.path.join(results_dir, f'{model_name}_evaluation_results_last{suffix}')
-            )
         except Exception as e:
             print(f"Error loading or evaluating last model {last_model_path}: {e}")
     else:
@@ -357,10 +414,12 @@ def evaluate_selected_models(selected_models, X_test, y_test, snr_test, mods,
         try:
             custom_objects = get_custom_objects_for_model(model_name)
             model_base_path = os.path.join(models_dir, f"{model_name}_model{suffix}")
+            input_shape = X_test.shape[1:]
+            num_classes = y_test.shape[1]
 
             evaluate_model_variants(
                 model_name, model_base_path, X_test, y_test, snr_test, mods,
-                results_dir, suffix, custom_objects
+                results_dir, input_shape, num_classes, suffix, custom_objects
             )
 
             print(f"Successfully completed evaluation for {model_name}")

@@ -49,3 +49,6 @@ IQFormer/
 *.keras
 
 CLAUDE.md
+
+prompt.md
+

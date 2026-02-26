@@ -4,9 +4,116 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 
 import time
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 
 from preprocess import load_data, prepare_data_by_snr_stratified
 from models import build_cnn1d_model, build_cnn2d_model, build_resnet_model, build_complex_nn_model, get_callbacks, get_detailed_logging_callback
+
+
+class SimpleHistory:
+    """Keras-like history wrapper for plotting compatibility."""
+
+    def __init__(self):
+        self.history = {
+            "loss": [],
+            "accuracy": [],
+            "val_loss": [],
+            "val_accuracy": [],
+        }
+
+
+def train_torch_model(model, X_train, y_train, X_val, y_val, model_path, batch_size=128, epochs=100, learning_rate=1e-3):
+    """Train a PyTorch model using the same data interface as Keras training."""
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+    X_train_t = torch.from_numpy(np.asarray(X_train)).float()
+    X_val_t = torch.from_numpy(np.asarray(X_val)).float()
+    y_train_t = torch.from_numpy(np.argmax(np.asarray(y_train), axis=1)).long()
+    y_val_t = torch.from_numpy(np.argmax(np.asarray(y_val), axis=1)).long()
+
+    train_loader = DataLoader(TensorDataset(X_train_t, y_train_t), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(TensorDataset(X_val_t, y_val_t), batch_size=batch_size, shuffle=False)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    history = SimpleHistory()
+    best_val_acc = -1.0
+    best_state = None
+    last_model_path = model_path.replace(".pt", "_last.pt")
+
+    print(f"Training PyTorch model, saving best to {model_path}")
+    start_time = time.time()
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item() * xb.size(0)
+            preds = torch.argmax(logits, dim=1)
+            train_correct += (preds == yb).sum().item()
+            train_total += xb.size(0)
+
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                logits = model(xb)
+                loss = criterion(logits, yb)
+                val_loss += loss.item() * xb.size(0)
+                preds = torch.argmax(logits, dim=1)
+                val_correct += (preds == yb).sum().item()
+                val_total += xb.size(0)
+
+        epoch_train_loss = train_loss / max(1, train_total)
+        epoch_train_acc = train_correct / max(1, train_total)
+        epoch_val_loss = val_loss / max(1, val_total)
+        epoch_val_acc = val_correct / max(1, val_total)
+
+        history.history["loss"].append(epoch_train_loss)
+        history.history["accuracy"].append(epoch_train_acc)
+        history.history["val_loss"].append(epoch_val_loss)
+        history.history["val_accuracy"].append(epoch_val_acc)
+
+        torch.save(model.state_dict(), last_model_path)
+        if epoch_val_acc > best_val_acc:
+            best_val_acc = epoch_val_acc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        print(
+            f"Epoch {epoch + 1}/{epochs} - "
+            f"loss: {epoch_train_loss:.4f} - accuracy: {epoch_train_acc:.4f} - "
+            f"val_loss: {epoch_val_loss:.4f} - val_accuracy: {epoch_val_acc:.4f}"
+        )
+
+    if best_state is not None:
+        torch.save(best_state, model_path)
+
+    training_time = time.time() - start_time
+    print(f"PyTorch training completed in {training_time:.2f} seconds")
+    print(f"Last epoch model saved to {last_model_path}")
+    return history
 
 
 def train_model(model, X_train, y_train, X_val, y_val, model_path, batch_size=128, epochs=100, detailed_logging=True):
