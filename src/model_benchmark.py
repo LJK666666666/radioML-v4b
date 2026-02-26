@@ -86,73 +86,8 @@ import math
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Import custom layers for model loading
-from model.complex_nn_model import (
-    ComplexConv1D, ComplexBatchNormalization, ComplexDense, ComplexMagnitude, 
-    ComplexActivation, ComplexPooling1D,
-    complex_relu, mod_relu, zrelu, crelu, cardioid, complex_tanh, phase_amplitude_activation,
-    complex_elu, complex_leaky_relu, complex_swish, real_imag_mixed_relu
-)
-from model.hybrid_complex_resnet_model import (
-    ComplexResidualBlock, ComplexResidualBlockAdvanced, ComplexGlobalAveragePooling1D
-)
-
-# Import ULCNN complex layers if available
-try:
-    from model.complexnn import (
-        ComplexConv1D as ULCNNComplexConv1D,
-        ComplexBatchNormalization as ULCNNComplexBatchNormalization,
-        ComplexDense as ULCNNComplexDense,
-        ChannelShuffle, DWConvMobile, ChannelAttention,
-        TransposeLayer, ExtractChannelLayer, TrigonometricLayer, sqrt_init
-    )
-    ULCNN_LAYERS_AVAILABLE = True
-except ImportError as e:
-    print(f"Warning: ULCNN complex layers not available: {e}")
-    ULCNN_LAYERS_AVAILABLE = False
-
-
-def get_custom_objects_dict():
-    """Get dictionary of all custom objects for model loading"""
-    custom_objects = {
-        'ComplexConv1D': ComplexConv1D,
-        'ComplexBatchNormalization': ComplexBatchNormalization,
-        'ComplexDense': ComplexDense,
-        'ComplexMagnitude': ComplexMagnitude,
-        'ComplexActivation': ComplexActivation,
-        'ComplexPooling1D': ComplexPooling1D,
-        'ComplexResidualBlock': ComplexResidualBlock,
-        'ComplexResidualBlockAdvanced': ComplexResidualBlockAdvanced,
-        'ComplexGlobalAveragePooling1D': ComplexGlobalAveragePooling1D,
-        'complex_relu': complex_relu,
-        'mod_relu': mod_relu,
-        'zrelu': zrelu,
-        'crelu': crelu,
-        'cardioid': cardioid,
-        'complex_tanh': complex_tanh,
-        'phase_amplitude_activation': phase_amplitude_activation,
-        'complex_elu': complex_elu,
-        'complex_leaky_relu': complex_leaky_relu,
-        'complex_swish': complex_swish,
-        'real_imag_mixed_relu': real_imag_mixed_relu
-    }
-    
-    # Add ULCNN-specific layers if available
-    if ULCNN_LAYERS_AVAILABLE:
-        custom_objects.update({
-            'ULCNNComplexConv1D': ULCNNComplexConv1D,
-            'ULCNNComplexBatchNormalization': ULCNNComplexBatchNormalization,
-            'ULCNNComplexDense': ULCNNComplexDense,
-            'ChannelShuffle': ChannelShuffle,
-            'DWConvMobile': DWConvMobile,
-            'ChannelAttention': ChannelAttention,
-            'TransposeLayer': TransposeLayer,
-            'ExtractChannelLayer': ExtractChannelLayer,
-            'TrigonometricLayer': TrigonometricLayer,
-            'sqrt_init': sqrt_init
-        })
-    
-    return custom_objects
+# Import custom objects registry (centralized in model/custom_objects.py)
+from model.custom_objects import get_all_custom_objects as get_custom_objects_dict
 
 
 def load_model_safely(model_path):

@@ -1,0 +1,1 @@
+python main.py --models pet --mode train --output_dir tests --epochs 1
