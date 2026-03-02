@@ -17,6 +17,7 @@ import random
 import numpy as np
 import tensorflow as tf
 import torch
+import yaml
 
 # Suppress TensorFlow warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 0=all logs, 1=filter INFO, 2=filter WARNING, 3=filter ERROR
@@ -166,6 +167,26 @@ def prepare_data_with_cache_suffix(dataset, cache_filename_suffix='', **kwargs):
         preprocess.create_denoised_filename = original_create_filename
 
 
+def load_training_config(config_path):
+    """Load YAML training config. Returns empty dict if file does not exist."""
+    if not config_path:
+        return {}
+    if not os.path.exists(config_path):
+        print(f"Config file not found: {config_path}. Using CLI/default parameters.")
+        return {}
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            cfg = yaml.safe_load(f) or {}
+        if not isinstance(cfg, dict):
+            print(f"Invalid config format in {config_path}. Using CLI/default parameters.")
+            return {}
+        print(f"Loaded config from: {config_path}")
+        return cfg
+    except Exception as e:
+        print(f"Failed to load config {config_path}: {e}. Using CLI/default parameters.")
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # Model registry
 # ---------------------------------------------------------------------------
@@ -255,8 +276,24 @@ def validate_model_selection(selected_models):
 # Train / Evaluate
 # ---------------------------------------------------------------------------
 
-def train_selected_models(selected_models, X_train, y_train, X_val, y_val, input_shape, num_classes,
-                          models_dir, plots_dir, suffix, batch_size, epochs):
+def train_selected_models(
+    selected_models,
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    input_shape,
+    num_classes,
+    models_dir,
+    plots_dir,
+    suffix,
+    batch_size,
+    epochs,
+    learning_rate,
+    patience_lr,
+    patience_es,
+    factor,
+):
     """Train all selected models"""
 
     for model_name in selected_models:
@@ -294,7 +331,11 @@ def train_selected_models(selected_models, X_train, y_train, X_val, y_val, input
                     X_val_model, y_val,
                     os.path.join(models_dir, f"{model_name}_model{suffix}.pt"),
                     batch_size=batch_size,
-                    epochs=epochs
+                    epochs=epochs,
+                    learning_rate=learning_rate,
+                    patience_lr=patience_lr,
+                    patience_es=patience_es,
+                    factor=factor,
                 )
             else:
                 history = train_model(
@@ -303,7 +344,10 @@ def train_selected_models(selected_models, X_train, y_train, X_val, y_val, input
                     X_val_model, y_val,
                     os.path.join(models_dir, f"{model_name}_model{suffix}.keras"),
                     batch_size=batch_size,
-                    epochs=epochs
+                    epochs=epochs,
+                    patience_lr=patience_lr,
+                    patience_es=patience_es,
+                    factor=factor,
                 )
 
             # Plot and save training history
@@ -467,13 +511,16 @@ Examples:
     parser.add_argument('--output_dir', type=str, default=None,
                         help='Directory for outputs (overrides dataset default)')
 
-    parser.add_argument('--epochs', type=int, default=200,
+    parser.add_argument('--config', type=str, default=None,
+                        help='Path to YAML config file for unified training parameters')
+
+    parser.add_argument('--epochs', type=int, default=None,
                         help='Number of training epochs')
 
-    parser.add_argument('--batch_size', type=int, default=128,
+    parser.add_argument('--batch_size', type=int, default=None,
                         help='Batch size for training')
 
-    parser.add_argument('--random_seed', type=int, default=42,
+    parser.add_argument('--random_seed', type=int, default=None,
                         help='Random seed for reproducibility')
 
     parser.add_argument('--augment_data', action='store_true',
@@ -499,6 +546,21 @@ Examples:
     dataset_suffix_prefix = ds_cfg['file_suffix_prefix']
     dataset_label = ds_cfg['dataset_label']
 
+    # Resolve unified training config (priority: CLI > YAML > hardcoded defaults)
+    default_config_path = os.path.join(os.path.dirname(__file__), 'config', 'training.yaml')
+    config_path = args.config or default_config_path
+    config = load_training_config(config_path)
+    train_cfg = config.get('training', {}) if isinstance(config.get('training', {}), dict) else {}
+    callback_cfg = config.get('callbacks', {}) if isinstance(config.get('callbacks', {}), dict) else {}
+
+    epochs = args.epochs if args.epochs is not None else int(train_cfg.get('epochs', 200))
+    batch_size = args.batch_size if args.batch_size is not None else int(train_cfg.get('batch_size', 128))
+    random_seed = args.random_seed if args.random_seed is not None else int(train_cfg.get('random_seed', 42))
+    learning_rate = float(train_cfg.get('learning_rate', 1e-3))
+    patience_lr = int(callback_cfg.get('patience_lr', 2))
+    patience_es = int(callback_cfg.get('patience_es', 30))
+    factor = float(callback_cfg.get('factor', 0.7))
+
     # Validate model selection
     if not validate_model_selection(args.models):
         return
@@ -510,7 +572,7 @@ Examples:
     print(f"Total models selected: {len(selected_models)}")
 
     # Set random seed
-    set_random_seed(args.random_seed)
+    set_random_seed(random_seed)
 
     # Configure GPU devices
     configure_gpu(args.gpu_id)
@@ -574,11 +636,16 @@ Examples:
         print(f"Input shape: {input_shape}")
         print(f"Number of classes: {num_classes}")
         print(f"Models to train: {selected_models}")
+        print(
+            f"Unified training params -> epochs: {epochs}, batch_size: {batch_size}, "
+            f"learning_rate: {learning_rate}, patience_lr: {patience_lr}, "
+            f"patience_es: {patience_es}, factor: {factor}"
+        )
 
         train_selected_models(
             selected_models, X_train, y_train, X_val, y_val,
             input_shape, num_classes, models_dir, plots_dir,
-            suffix, args.batch_size, args.epochs
+            suffix, batch_size, epochs, learning_rate, patience_lr, patience_es, factor
         )
 
     # Evaluation

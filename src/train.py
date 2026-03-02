@@ -35,7 +35,8 @@ def train_torch_model(
     epochs=100,
     learning_rate=1e-3,
     patience_lr=2,
-    patience_es=30,
+    patience_es=15,
+    factor=0.7,
 ):
     """Train a PyTorch model using the same data interface as Keras training."""
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
@@ -56,7 +57,7 @@ def train_torch_model(
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="max",      # align with callbacks.py monitoring val_accuracy
-        factor=0.7,
+        factor=factor,
         patience=patience_lr,
         min_lr=1e-7,
     )
@@ -156,7 +157,20 @@ def train_torch_model(
     return history
 
 
-def train_model(model, X_train, y_train, X_val, y_val, model_path, batch_size=128, epochs=100, detailed_logging=True):
+def train_model(
+    model,
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    model_path,
+    batch_size=128,
+    epochs=100,
+    detailed_logging=True,
+    patience_lr=2,
+    patience_es=30,
+    factor=0.7,
+):
     """
     Train a model and save it.
     
@@ -177,7 +191,12 @@ def train_model(model, X_train, y_train, X_val, y_val, model_path, batch_size=12
 
     # Standard Keras model training
     # Prepare callbacks
-    callbacks = get_callbacks(model_path)
+    callbacks = get_callbacks(
+        model_path,
+        patience_lr=patience_lr,
+        patience_es=patience_es,
+        factor=factor
+    )
 
     # Add detailed logging callback if enabled
     if detailed_logging:
