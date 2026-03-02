@@ -24,7 +24,19 @@ class SimpleHistory:
         }
 
 
-def train_torch_model(model, X_train, y_train, X_val, y_val, model_path, batch_size=128, epochs=100, learning_rate=1e-3):
+def train_torch_model(
+    model,
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    model_path,
+    batch_size=128,
+    epochs=100,
+    learning_rate=1e-3,
+    patience_lr=2,
+    patience_es=30,
+):
     """Train a PyTorch model using the same data interface as Keras training."""
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
 
@@ -41,10 +53,18 @@ def train_torch_model(model, X_train, y_train, X_val, y_val, model_path, batch_s
 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",      # align with callbacks.py monitoring val_accuracy
+        factor=0.7,
+        patience=patience_lr,
+        min_lr=1e-7,
+    )
 
     history = SimpleHistory()
     best_val_acc = -1.0
     best_state = None
+    epochs_without_improvement = 0
     last_model_path = model_path.replace(".pt", "_last.pt")
 
     print(f"Training PyTorch model, saving best to {model_path}")
@@ -96,10 +116,20 @@ def train_torch_model(model, X_train, y_train, X_val, y_val, model_path, batch_s
         history.history["val_loss"].append(epoch_val_loss)
         history.history["val_accuracy"].append(epoch_val_acc)
 
+        # ReduceLROnPlateau on val_accuracy (same semantics as callbacks.py)
+        old_lr = optimizer.param_groups[0]["lr"]
+        scheduler.step(epoch_val_acc)
+        new_lr = optimizer.param_groups[0]["lr"]
+        if new_lr < old_lr:
+            print(f"ReduceLROnPlateau: lr reduced from {old_lr:.8f} to {new_lr:.8f}")
+
         torch.save(model.state_dict(), last_model_path)
         if epoch_val_acc > best_val_acc:
             best_val_acc = epoch_val_acc
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
 
         print(
             f"Epoch {epoch + 1}/{epochs} - "
@@ -107,7 +137,17 @@ def train_torch_model(model, X_train, y_train, X_val, y_val, model_path, batch_s
             f"val_loss: {epoch_val_loss:.4f} - val_accuracy: {epoch_val_acc:.4f}"
         )
 
+        # EarlyStopping on val_accuracy, restore best weights
+        if epochs_without_improvement >= patience_es:
+            print(
+                f"EarlyStopping triggered at epoch {epoch + 1}. "
+                f"No val_accuracy improvement for {patience_es} epochs."
+            )
+            break
+
     if best_state is not None:
+        # restore_best_weights=True semantics
+        model.load_state_dict(best_state)
         torch.save(best_state, model_path)
 
     training_time = time.time() - start_time
