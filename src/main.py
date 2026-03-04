@@ -8,6 +8,12 @@ python main.py --models resnet cnn1d --mode train
 python main.py --models hybrid_complex_resnet --mode evaluate
 python main.py --models cnn2d complex_nn --mode all --epochs 100
 python main.py --dataset 2016b --models resnet --mode train
+
+# SNR prediction workflow
+python main.py --mode snr --snr_model snr_cnn --epochs 100
+python main.py --mode denoise --use_predicted_snr --augment_data
+python main.py --mode train --use_predicted_snr --models resnet --augment_data
+python main.py --mode evaluate --use_predicted_snr --models resnet --augment_data
 """
 
 import os
@@ -25,7 +31,7 @@ tf.get_logger().setLevel('ERROR')
 
 # Import project modules
 from explore_dataset import load_radioml_data, explore_dataset, plot_signal_examples
-from preprocess import prepare_data_by_snr_stratified
+from preprocess import prepare_data_by_snr_stratified, split_data_raw
 from train import train_model, train_torch_model, plot_training_history
 from models import (
     build_cnn1d_model, build_cnn2d_model, build_resnet_model, build_complex_nn_model,
@@ -40,10 +46,17 @@ from models import (
     # New ultra-lightweight hybrid models
     build_ultra_lightweight_hybrid_model, build_micro_lightweight_hybrid_model,
     # PyTorch models
-    build_iqformer_model, build_fea_t_model
+    build_iqformer_model, build_fea_t_model,
+    # SNR predictor
+    build_snr_predictor, get_available_snr_models,
 )
 from evaluate import evaluate_by_snr, evaluate_torch_by_snr
 from model.custom_objects import get_custom_objects_for_model
+from snr_predict import (
+    train_snr_predictor, predict_snr, save_snr_predictions, load_snr_predictions,
+    evaluate_snr_predictor, plot_snr_training_history,
+)
+from denoise import denoise_and_cache_splits, load_cached_splits
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +149,23 @@ def get_file_suffix(denoising_method, augment_data, dataset_suffix_prefix=''):
     if augment_data:
         suffix += "_augment"
     return suffix
+
+
+def get_cache_tag(denoising_method, augment_data, use_predicted_snr=False, snr_model='snr_cnn'):
+    """Generate a cache tag for denoised split files.
+
+    Examples:
+        efficient_gpr_per_sample_realsnr_augment
+        efficient_gpr_per_sample_predsnr_snr_cnn_augment
+    """
+    tag = denoising_method if denoising_method != 'none' else 'none'
+    if use_predicted_snr:
+        tag += f"_predsnr_{snr_model}"
+    else:
+        tag += "_realsnr"
+    if augment_data:
+        tag += "_augment"
+    return tag
 
 
 def prepare_data_with_cache_suffix(dataset, cache_filename_suffix='', **kwargs):
@@ -497,13 +527,23 @@ Examples:
                         help='Dataset version to use (default: 2016a)')
 
     parser.add_argument('--mode', type=str, default='all',
-                        choices=['explore', 'train', 'evaluate', 'all'],
+                        choices=['explore', 'snr', 'denoise', 'train', 'evaluate', 'all'],
                         help='Mode of operation')
 
     parser.add_argument('--models', type=str, nargs='+',
                         choices=get_available_models(),
-                        required=True,
-                        help='Model architectures to use (select multiple)')
+                        default=None,
+                        help='Model architectures to use (required for train/evaluate/all)')
+
+    parser.add_argument('--snr_model', type=str, default='snr_cnn',
+                        choices=get_available_snr_models(),
+                        help='SNR predictor model architecture (default: snr_cnn)')
+
+    parser.add_argument('--use_predicted_snr', action='store_true',
+                        help='Use predicted SNR for val/test denoising (train always uses real SNR)')
+
+    parser.add_argument('--snr_predictions_path', type=str, default=None,
+                        help='Path to SNR predictions .npz file (auto-detected if not specified)')
 
     parser.add_argument('--dataset_path', type=str, default=None,
                         help='Path to the RadioML dataset (overrides dataset default)')
@@ -538,6 +578,10 @@ Examples:
 
     args = parser.parse_args()
 
+    # --models is required for train/evaluate/all modes
+    if args.mode in ['train', 'evaluate', 'all'] and not args.models:
+        parser.error(f"--models is required for --mode {args.mode}")
+
     # Resolve dataset-specific defaults
     ds_cfg = DATASET_CONFIGS[args.dataset]
     dataset_path = args.dataset_path or ds_cfg['dataset_path']
@@ -552,6 +596,7 @@ Examples:
     config = load_training_config(config_path)
     train_cfg = config.get('training', {}) if isinstance(config.get('training', {}), dict) else {}
     callback_cfg = config.get('callbacks', {}) if isinstance(config.get('callbacks', {}), dict) else {}
+    snr_cfg = config.get('snr_training', {}) if isinstance(config.get('snr_training', {}), dict) else {}
 
     epochs = args.epochs if args.epochs is not None else int(train_cfg.get('epochs', 200))
     batch_size = args.batch_size if args.batch_size is not None else int(train_cfg.get('batch_size', 128))
@@ -561,15 +606,25 @@ Examples:
     patience_es = int(callback_cfg.get('patience_es', 30))
     factor = float(callback_cfg.get('factor', 0.7))
 
-    # Validate model selection
-    if not validate_model_selection(args.models):
-        return
+    # SNR training params (from snr_training config section, overridden by CLI)
+    snr_epochs = args.epochs if args.epochs is not None else int(snr_cfg.get('epochs', 100))
+    snr_batch_size = args.batch_size if args.batch_size is not None else int(snr_cfg.get('batch_size', 256))
+    snr_lr = float(snr_cfg.get('learning_rate', 1e-3))
+    snr_patience_lr = int(snr_cfg.get('patience_lr', 5))
+    snr_patience_es = int(snr_cfg.get('patience_es', 20))
+    snr_factor = float(snr_cfg.get('factor', 0.5))
 
-    selected_models = expand_model_selection(args.models)
+    # Validate model selection (only if models specified)
+    selected_models = []
+    if args.models:
+        if not validate_model_selection(args.models):
+            return
+        selected_models = expand_model_selection(args.models)
 
     print(f"Dataset: {dataset_label}")
-    print(f"Selected models for processing: {selected_models}")
-    print(f"Total models selected: {len(selected_models)}")
+    print(f"Mode: {args.mode}")
+    if selected_models:
+        print(f"Selected models: {selected_models}")
 
     # Set random seed
     set_random_seed(random_seed)
@@ -598,36 +653,191 @@ Examples:
         return
     print(f"Dataset loaded in {time.time() - start_time:.2f} seconds")
 
-    # Explore dataset
-    if args.mode in ['explore', 'all']:
+    # -----------------------------------------------------------------------
+    # Explore dataset (standalone only, no longer part of 'all')
+    # -----------------------------------------------------------------------
+    if args.mode == 'explore':
         print(f"\n{'='*60}")
         print("EXPLORING DATASET")
         print(f"{'='*60}")
         mods, snrs = explore_dataset(dataset)
         plot_signal_examples(dataset, mods, os.path.join(output_dir, 'exploration'))
 
-    # Prepare data
-    if args.mode in ['train', 'evaluate', 'all']:
+    # -----------------------------------------------------------------------
+    # SNR prediction mode
+    # -----------------------------------------------------------------------
+    if args.mode == 'snr':
         print(f"\n{'='*60}")
-        print("PREPARING DATA")
+        print("SNR PREDICTION MODE")
         print(f"{'='*60}")
 
-        print("Using stratified splitting by (modulation type, SNR) combinations...")
-        X_train, X_val, X_test, y_train, y_val, y_test, snr_train, snr_val, snr_test, mods = prepare_data_with_cache_suffix(
-            dataset,
-            cache_filename_suffix=dataset_suffix_prefix,
-            augment_data=args.augment_data,
-            denoising_method=args.denoising_method,
-            denoised_cache_dir=denoised_cache_dir
+        # Raw split (no denoising, no augmentation, no one-hot)
+        X_train, X_val, X_test, y_train_int, y_val_int, y_test_int, \
+            snr_train, snr_val, snr_test, mods = split_data_raw(dataset)
+
+        # Build SNR class mapping: sorted unique SNR values -> class indices
+        snr_classes = sorted(list(set(np.concatenate([snr_train, snr_val, snr_test]).tolist())))
+        snr_classes = np.array(snr_classes)
+        snr_to_idx = {v: i for i, v in enumerate(snr_classes)}
+        num_snr_classes = len(snr_classes)
+        print(f"SNR classes ({num_snr_classes}): {snr_classes.tolist()}")
+
+        # Convert SNR dB values to class indices
+        snr_labels_train = np.array([snr_to_idx[v] for v in snr_train])
+        snr_labels_val = np.array([snr_to_idx[v] for v in snr_val])
+        snr_labels_test = np.array([snr_to_idx[v] for v in snr_test])
+
+        # Build and train SNR predictor
+        snr_model = build_snr_predictor(
+            args.snr_model,
+            input_channels=X_train.shape[1],
+            seq_len=X_train.shape[2],
+            num_snr_classes=num_snr_classes,
+        )
+        total_params = sum(p.numel() for p in snr_model.parameters())
+        print(f"SNR predictor ({args.snr_model}): {total_params:,} parameters")
+        print(snr_model)
+
+        suffix = f"{dataset_suffix_prefix}_stratified"
+        snr_model_path = os.path.join(models_dir, f"snr_{args.snr_model}{suffix}.pt")
+
+        print(
+            f"SNR training params -> epochs: {snr_epochs}, batch_size: {snr_batch_size}, "
+            f"lr: {snr_lr}, patience_lr: {snr_patience_lr}, "
+            f"patience_es: {snr_patience_es}, factor: {snr_factor}"
         )
 
+        history = train_snr_predictor(
+            snr_model, X_train, snr_labels_train, X_val, snr_labels_val,
+            snr_model_path,
+            batch_size=snr_batch_size,
+            epochs=snr_epochs,
+            learning_rate=snr_lr,
+            patience_lr=snr_patience_lr,
+            patience_es=snr_patience_es,
+            factor=snr_factor,
+        )
+
+        # Plot training curves
+        plot_snr_training_history(
+            history,
+            os.path.join(plots_dir, f"snr_{args.snr_model}{suffix}.png")
+        )
+
+        # Predict SNR on val and test
+        pred_val = predict_snr(snr_model, X_val, snr_classes, batch_size=snr_batch_size)
+        pred_test = predict_snr(snr_model, X_test, snr_classes, batch_size=snr_batch_size)
+
+        # Save predictions
+        pred_save_path = os.path.join(output_dir, f"snr_predictions_{args.snr_model}{suffix}.npz")
+        save_snr_predictions(pred_val, pred_test, snr_val, snr_test, pred_save_path)
+
+        # Evaluate
+        eval_dir = os.path.join(results_dir, f"snr_{args.snr_model}_eval{suffix}")
+        evaluate_snr_predictor(snr_val, pred_val, snr_classes, eval_dir, split_name="val")
+        evaluate_snr_predictor(snr_test, pred_test, snr_classes, eval_dir, split_name="test")
+
+    # -----------------------------------------------------------------------
+    # Denoise mode
+    # -----------------------------------------------------------------------
+    if args.mode == 'denoise':
+        print(f"\n{'='*60}")
+        print("STANDALONE DENOISE MODE")
+        print(f"{'='*60}")
+
+        # Raw split
+        X_train, X_val, X_test, y_train_int, y_val_int, y_test_int, \
+            snr_train, snr_val, snr_test, mods = split_data_raw(dataset)
+
+        # Determine SNR values for val/test denoising
+        snr_val_for_denoise = snr_val
+        snr_test_for_denoise = snr_test
+
+        if args.use_predicted_snr:
+            # Load predicted SNR
+            suffix = f"{dataset_suffix_prefix}_stratified"
+            pred_path = args.snr_predictions_path or \
+                os.path.join(output_dir, f"snr_predictions_{args.snr_model}{suffix}.npz")
+            print(f"Loading predicted SNR from {pred_path}...")
+            preds = load_snr_predictions(pred_path)
+            snr_val_for_denoise = preds['snr_pred_val']
+            snr_test_for_denoise = preds['snr_pred_test']
+            print(f"Using predicted SNR for val ({len(snr_val_for_denoise)} samples) "
+                  f"and test ({len(snr_test_for_denoise)} samples)")
+        else:
+            print("Using real SNR for all splits")
+
+        cache_tag = get_cache_tag(args.denoising_method, args.augment_data,
+                                  args.use_predicted_snr, args.snr_model)
+        cache_tag += dataset_suffix_prefix
+
+        denoise_and_cache_splits(
+            X_train, X_val, X_test,
+            y_train_int, y_val_int, y_test_int,
+            snr_train, snr_val, snr_test,
+            mods, args.denoising_method, denoised_cache_dir, cache_tag,
+            args.augment_data,
+            snr_val_for_denoise, snr_test_for_denoise,
+        )
+
+    # -----------------------------------------------------------------------
+    # Prepare data for train / evaluate / all
+    # -----------------------------------------------------------------------
+    if args.mode in ['train', 'evaluate', 'all']:
+        if args.use_predicted_snr:
+            # Load from denoise cache
+            cache_tag = get_cache_tag(args.denoising_method, args.augment_data,
+                                      args.use_predicted_snr, args.snr_model)
+            cache_tag += dataset_suffix_prefix
+
+            print(f"\n{'='*60}")
+            print("LOADING CACHED DENOISED DATA (predicted SNR)")
+            print(f"{'='*60}")
+            print(f"Cache tag: {cache_tag}")
+
+            cached = load_cached_splits(denoised_cache_dir, cache_tag)
+            if cached is None:
+                print(f"Error: Cache not found for tag '{cache_tag}'.")
+                print("Please run --mode denoise --use_predicted_snr first.")
+                return
+
+            X_train = cached['X_train']
+            X_val = cached['X_val']
+            X_test = cached['X_test']
+            y_train = cached['y_train']
+            y_val = cached['y_val']
+            y_test = cached['y_test']
+            snr_train = cached['snr_train']
+            snr_val = cached['snr_val']
+            snr_test = cached['snr_test']
+            mods = cached['mods']
+        else:
+            # Original flow: denoise all -> split -> augment -> one-hot
+            print(f"\n{'='*60}")
+            print("PREPARING DATA")
+            print(f"{'='*60}")
+
+            print("Using stratified splitting by (modulation type, SNR) combinations...")
+            X_train, X_val, X_test, y_train, y_val, y_test, \
+                snr_train, snr_val, snr_test, mods = prepare_data_with_cache_suffix(
+                    dataset,
+                    cache_filename_suffix=dataset_suffix_prefix,
+                    augment_data=args.augment_data,
+                    denoising_method=args.denoising_method,
+                    denoised_cache_dir=denoised_cache_dir
+                )
+
+    # -----------------------------------------------------------------------
     # Training
+    # -----------------------------------------------------------------------
     if args.mode in ['train', 'all']:
         print(f"\n{'='*60}")
         print("TRAINING SELECTED MODELS")
         print(f"{'='*60}")
 
         suffix = get_file_suffix(args.denoising_method, args.augment_data, dataset_suffix_prefix)
+        if args.use_predicted_snr:
+            suffix += f"_predsnr_{args.snr_model}"
         suffix += "_stratified"
 
         input_shape = X_train.shape[1:]
@@ -648,13 +858,17 @@ Examples:
             suffix, batch_size, epochs, learning_rate, patience_lr, patience_es, factor
         )
 
+    # -----------------------------------------------------------------------
     # Evaluation
+    # -----------------------------------------------------------------------
     if args.mode in ['evaluate', 'all']:
         print(f"\n{'='*60}")
         print("EVALUATING SELECTED MODELS")
         print(f"{'='*60}")
 
         suffix = get_file_suffix(args.denoising_method, args.augment_data, dataset_suffix_prefix)
+        if args.use_predicted_snr:
+            suffix += f"_predsnr_{args.snr_model}"
         suffix += "_stratified"
 
         print(f"Models to evaluate: {selected_models}")
@@ -668,7 +882,9 @@ Examples:
     print("ALL OPERATIONS COMPLETED SUCCESSFULLY!")
     print(f"{'='*60}")
     print(f"Dataset: {dataset_label}")
-    print(f"Processed models: {selected_models}")
+    print(f"Mode: {args.mode}")
+    if selected_models:
+        print(f"Processed models: {selected_models}")
     print(f"Results saved to: {output_dir}")
 
 

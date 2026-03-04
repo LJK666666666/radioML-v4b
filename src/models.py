@@ -28,3 +28,6 @@ from model.fea_t_torch_model import build_fea_t_model
 
 from model.callbacks import get_callbacks
 from model.detailed_logging_callback import get_detailed_logging_callback
+
+# SNR predictor models (PyTorch)
+from model.snr_predictor_model import build_snr_predictor, get_available_snr_models
