@@ -97,10 +97,22 @@ def set_random_seed(seed=42):
 
 def configure_gpu(gpu_id=None):
     """Configure GPU devices for training"""
+    # Check PyTorch CUDA
+    if torch.cuda.is_available():
+        torch_gpu_name = torch.cuda.get_device_name(0)
+        print(f"PyTorch CUDA available: {torch_gpu_name} (CUDA {torch.version.cuda})")
+    else:
+        print("PyTorch CUDA not available.")
+
+    # Check TensorFlow GPU
     gpus = tf.config.list_physical_devices('GPU')
 
     if not gpus:
-        print("No GPUs found. Using CPU for training.")
+        if torch.cuda.is_available():
+            print("TensorFlow GPU not available (TF 2.13 may not support current CUDA version). "
+                  "PyTorch models will still use GPU.")
+        else:
+            print("No GPUs found. Using CPU for training.")
         return
 
     print(f"Available GPUs: {[gpu.name for gpu in gpus]}")
