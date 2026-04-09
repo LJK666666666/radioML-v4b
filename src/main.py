@@ -406,7 +406,8 @@ def train_selected_models(
 
 
 def evaluate_model_variants(model_name, model_base_path, X_test, y_test, snr_test, mods,
-                            results_dir, input_shape, num_classes, suffix="", custom_objects=None):
+                            results_dir, input_shape, num_classes, suffix="", custom_objects=None,
+                            results_suffix=None):
     """Evaluate both the best model and the last epoch model for a given model type.
 
     Args:
@@ -417,6 +418,10 @@ def evaluate_model_variants(model_name, model_base_path, X_test, y_test, snr_tes
         suffix: File suffix for distinguishing configurations
         custom_objects: Custom objects needed for model loading (optional)
     """
+    # results_suffix controls result folder naming (may include _predsnr_*),
+    # while `suffix` controls the model weight filename (never includes _predsnr).
+    if results_suffix is None:
+        results_suffix = suffix
     # Standard Keras/PyTorch model evaluation
     model_ext = ".pt" if is_torch_model_name(model_name) else ".keras"
     best_model_path = model_base_path + model_ext
@@ -433,7 +438,7 @@ def evaluate_model_variants(model_name, model_base_path, X_test, y_test, snr_tes
                 evaluate_torch_by_snr(
                     best_model,
                     X_test, y_test, snr_test, mods,
-                    os.path.join(results_dir, f'{model_name}_evaluation_results{suffix}')
+                    os.path.join(results_dir, f'{model_name}_evaluation_results{results_suffix}')
                 )
             else:
                 if custom_objects:
@@ -443,7 +448,7 @@ def evaluate_model_variants(model_name, model_base_path, X_test, y_test, snr_tes
                 evaluate_by_snr(
                     best_model,
                     X_test, y_test, snr_test, mods,
-                    os.path.join(results_dir, f'{model_name}_evaluation_results{suffix}')
+                    os.path.join(results_dir, f'{model_name}_evaluation_results{results_suffix}')
                 )
             print(f"Successfully loaded best model from {best_model_path}")
         except Exception as e:
@@ -466,7 +471,7 @@ def evaluate_model_variants(model_name, model_base_path, X_test, y_test, snr_tes
                 evaluate_torch_by_snr(
                     last_model,
                     X_test, y_test, snr_test, mods,
-                    os.path.join(results_dir, f'{model_name}_evaluation_results_last{suffix}')
+                    os.path.join(results_dir, f'{model_name}_evaluation_results_last{results_suffix}')
                 )
             else:
                 if custom_objects:
@@ -476,7 +481,7 @@ def evaluate_model_variants(model_name, model_base_path, X_test, y_test, snr_tes
                 evaluate_by_snr(
                     last_model,
                     X_test, y_test, snr_test, mods,
-                    os.path.join(results_dir, f'{model_name}_evaluation_results_last{suffix}')
+                    os.path.join(results_dir, f'{model_name}_evaluation_results_last{results_suffix}')
                 )
             print(f"Successfully loaded last epoch model from {last_model_path}")
         except Exception as e:
@@ -486,7 +491,7 @@ def evaluate_model_variants(model_name, model_base_path, X_test, y_test, snr_tes
 
 
 def evaluate_selected_models(selected_models, X_test, y_test, snr_test, mods,
-                             models_dir, results_dir, suffix):
+                             models_dir, results_dir, suffix, results_suffix=None):
     """Evaluate all selected models"""
 
     # Enable unsafe deserialization for models with custom layers
@@ -505,7 +510,8 @@ def evaluate_selected_models(selected_models, X_test, y_test, snr_test, mods,
 
             evaluate_model_variants(
                 model_name, model_base_path, X_test, y_test, snr_test, mods,
-                results_dir, input_shape, num_classes, suffix, custom_objects
+                results_dir, input_shape, num_classes, suffix, custom_objects,
+                results_suffix=results_suffix
             )
 
             print(f"Successfully completed evaluation for {model_name}")
@@ -911,9 +917,8 @@ Examples:
         print("TRAINING SELECTED MODELS")
         print(f"{'='*60}")
 
+        # Model weights never encode predicted-SNR usage (training always uses real SNR).
         suffix = get_file_suffix(args.denoising_method, args.augment_data, dataset_suffix_prefix)
-        if args.use_predicted_snr:
-            suffix += f"_predsnr_{args.snr_model}"
         suffix += "_stratified"
 
         input_shape = X_train.shape[1:]
@@ -942,16 +947,18 @@ Examples:
         print("EVALUATING SELECTED MODELS")
         print(f"{'='*60}")
 
-        suffix = get_file_suffix(args.denoising_method, args.augment_data, dataset_suffix_prefix)
+        # Model weight suffix (no predsnr); results suffix distinguishes pred-SNR eval runs.
+        suffix = get_file_suffix(args.denoising_method, args.augment_data, dataset_suffix_prefix) + "_stratified"
+        results_suffix = get_file_suffix(args.denoising_method, args.augment_data, dataset_suffix_prefix)
         if args.use_predicted_snr:
-            suffix += f"_predsnr_{args.snr_model}"
-        suffix += "_stratified"
+            results_suffix += f"_predsnr_{args.snr_model}"
+        results_suffix += "_stratified"
 
         print(f"Models to evaluate: {selected_models}")
 
         evaluate_selected_models(
             selected_models, X_test, y_test, snr_test, mods,
-            models_dir, results_dir, suffix
+            models_dir, results_dir, suffix, results_suffix=results_suffix
         )
 
     print(f"\n{'='*60}")
