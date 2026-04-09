@@ -7,7 +7,40 @@ import time
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+
+
+def make_gaussian_soft_label_matrix(num_classes, sigma=1.0):
+    """Build (C, C) soft-label matrix where row i is a Gaussian distribution
+    centered at class i with std sigma (in units of class index step).
+
+    Used to implement a distance-aware loss for ordinal SNR classification:
+    neighbor classes receive nonzero target probability, so misclassifying
+    -20 dB as -18 dB is penalized much less than -20 dB as +18 dB.
+    See guide/update1.md (method 1).
+    """
+    idx = np.arange(num_classes)
+    diff = idx[:, None] - idx[None, :]  # row i - col j
+    logits = -(diff.astype(np.float64) ** 2) / (2.0 * float(sigma) ** 2)
+    logits -= logits.max(axis=1, keepdims=True)
+    exp = np.exp(logits)
+    q = exp / exp.sum(axis=1, keepdims=True)
+    return q.astype(np.float32)
+
+
+class GaussianSoftLabelLoss(nn.Module):
+    """Distance-aware cross-entropy: targets are Gaussian-smoothed one-hots."""
+
+    def __init__(self, num_classes, sigma=1.0):
+        super().__init__()
+        mat = make_gaussian_soft_label_matrix(num_classes, sigma=sigma)
+        self.register_buffer("soft_labels", torch.from_numpy(mat))
+
+    def forward(self, logits, target_idx):
+        log_probs = F.log_softmax(logits, dim=1)
+        target = self.soft_labels[target_idx]
+        return -(target * log_probs).sum(dim=1).mean()
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -15,7 +48,8 @@ import matplotlib.pyplot as plt
 
 def train_snr_predictor(model, X_train, snr_labels_train, X_val, snr_labels_val,
                         model_path, batch_size=256, epochs=100, learning_rate=1e-3,
-                        patience_lr=5, patience_es=20, factor=0.5):
+                        patience_lr=5, patience_es=20, factor=0.5,
+                        soft_label_sigma=1.0):
     """Train SNR classifier.
 
     Labels (snr_labels_train / snr_labels_val) are integer class indices,
@@ -41,7 +75,14 @@ def train_snr_predictor(model, X_train, snr_labels_train, X_val, snr_labels_val,
     val_loader = DataLoader(TensorDataset(X_val_t, y_val_t),
                             batch_size=batch_size, shuffle=False)
 
-    criterion = nn.CrossEntropyLoss()
+    # Distance-aware loss (Gaussian soft labels). Falls back to hard CE
+    # when soft_label_sigma <= 0.
+    num_snr_classes = int(max(y_train_t.max().item(), y_val_t.max().item())) + 1
+    if soft_label_sigma and soft_label_sigma > 0:
+        criterion = GaussianSoftLabelLoss(num_snr_classes, sigma=soft_label_sigma).to(device)
+        print(f"Using GaussianSoftLabelLoss (num_classes={num_snr_classes}, sigma={soft_label_sigma})")
+    else:
+        criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=factor, patience=patience_lr, min_lr=1e-7

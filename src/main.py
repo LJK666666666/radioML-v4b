@@ -56,7 +56,7 @@ from snr_predict import (
     train_snr_predictor, predict_snr, save_snr_predictions, load_snr_predictions,
     evaluate_snr_predictor, plot_snr_training_history,
 )
-from denoise import denoise_and_cache_splits, load_cached_splits
+from denoise import denoise_and_cache_splits, load_cached_splits, denoise_split
 
 
 # ---------------------------------------------------------------------------
@@ -539,7 +539,7 @@ Examples:
                         help='Dataset version to use (default: 2016a)')
 
     parser.add_argument('--mode', type=str, default='all',
-                        choices=['explore', 'snr', 'denoise', 'train', 'evaluate', 'all'],
+                        choices=['explore', 'snr', 'snr_robust', 'denoise', 'train', 'evaluate', 'all'],
                         help='Mode of operation')
 
     parser.add_argument('--models', type=str, nargs='+',
@@ -585,13 +585,17 @@ Examples:
     parser.add_argument('--denoised_cache_dir', type=str, default=None,
                         help='Directory to save/load cached denoised datasets (overrides dataset default)')
 
+    parser.add_argument('--snr_noise_stds', type=float, nargs='+',
+                        default=[0.0, 1.0, 2.0, 4.0, 6.0, 10.0],
+                        help='Gaussian std (dB) levels for --mode snr_robust')
+
     parser.add_argument('--gpu_id', type=str, default=None,
                         help='GPU device ID(s) to use (e.g., "0", "1", "0,1"). If not specified, uses all available GPUs.')
 
     args = parser.parse_args()
 
     # --models is required for train/evaluate/all modes
-    if args.mode in ['train', 'evaluate', 'all'] and not args.models:
+    if args.mode in ['train', 'evaluate', 'all', 'snr_robust'] and not args.models:
         parser.error(f"--models is required for --mode {args.mode}")
 
     # Resolve dataset-specific defaults
@@ -791,6 +795,66 @@ Examples:
             args.augment_data,
             snr_val_for_denoise, snr_test_for_denoise,
         )
+
+    # -----------------------------------------------------------------------
+    # SNR-perturbation robustness mode
+    # -----------------------------------------------------------------------
+    if args.mode == 'snr_robust':
+        print(f"\n{'='*60}")
+        print("SNR PERTURBATION ROBUSTNESS MODE")
+        print(f"{'='*60}")
+
+        X_train_r, X_val_r, X_test_r, y_train_int, y_val_int, y_test_int, \
+            snr_train, snr_val, snr_test, mods = split_data_raw(dataset)
+
+        snr_classes = np.array(sorted(set(snr_test.tolist())), dtype=float)
+        num_mods = len(mods)
+        y_test_oh = np.eye(num_mods, dtype=np.float32)[y_test_int]
+
+        train_suffix = get_file_suffix(args.denoising_method, args.augment_data,
+                                       dataset_suffix_prefix) + "_stratified"
+        robust_root = os.path.join(results_dir, f"snr_robust{train_suffix}")
+        os.makedirs(robust_root, exist_ok=True)
+
+        rng = np.random.default_rng(random_seed)
+        summary_rows = []  # (noise_std, model_name, overall_acc) parsed from eval outputs
+
+        for noise_std in args.snr_noise_stds:
+            print(f"\n--- SNR noise std = {noise_std} dB ---")
+            if noise_std <= 0:
+                snr_test_pert = snr_test.astype(float).copy()
+            else:
+                noise = rng.normal(0.0, float(noise_std), size=snr_test.shape)
+                perturbed = snr_test.astype(float) + noise
+                # Snap to nearest valid SNR class
+                idx = np.argmin(np.abs(perturbed[:, None] - snr_classes[None, :]), axis=1)
+                snr_test_pert = snr_classes[idx]
+            mae = float(np.mean(np.abs(snr_test_pert - snr_test.astype(float))))
+            print(f"Perturbed-SNR MAE vs true: {mae:.2f} dB")
+
+            if args.denoising_method.lower() == 'none':
+                X_test_dn = X_test_r
+            else:
+                X_test_dn = denoise_split(
+                    X_test_r, y_test_int, snr_test_pert, mods,
+                    args.denoising_method,
+                    split_name=f"test_snrnoise{noise_std:g}"
+                )
+
+            sub_results_dir = os.path.join(robust_root, f"noisestd_{noise_std:g}")
+            os.makedirs(sub_results_dir, exist_ok=True)
+            # Save the perturbed SNR used, for reproducibility
+            np.savez(os.path.join(sub_results_dir, "perturbed_snr.npz"),
+                     snr_true=snr_test, snr_perturbed=snr_test_pert, noise_std=noise_std)
+
+            # Evaluate (grouping per-SNR accuracy by the TRUE snr_test)
+            evaluate_selected_models(
+                selected_models, X_test_dn, y_test_oh, snr_test, mods,
+                models_dir, sub_results_dir, train_suffix
+            )
+
+        print(f"\nSNR robustness results saved under: {robust_root}")
+        return
 
     # -----------------------------------------------------------------------
     # Prepare data for train / evaluate / all
