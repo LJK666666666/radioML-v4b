@@ -63,3 +63,124 @@ python main.py --mode train --use_predicted_snr --models resnet --augment_data
 
 # 4. 评估
 python main.py --mode evaluate --use_predicted_snr --models resnet --augment_data
+
+
+  已完成的修改
+
+  论文正文 (paper/CL/double3/double_done_3.tex):
+
+  1. 移除旋转数据增强 — 删除了 "Rotation-Based Data Augmentation" 小节（含星座图figure和公式）、贡献列表中的相关条目、表格中的 +Aug 列、结论中的相关描述
+  2. 移除复数残差神经网络 — 删除了 "Complex-Valued Residual Neural Network" 整个小节（含Complex-ResNet架构图、表格）、收敛曲线分析小节
+  3. 更新模型列表 — 移除 MCNET/CGDNN/ComplexCNN/ResNet/Complex-ResNet-mini/Complex-ResNet，保留 ULCNN/MCLDNN/PETCGDNN，添加 AMC-Net/FEA-T/IQFormer
+  4. 添加 Related Work — 新增简洁的两段式相关工作部分
+  5. 添加 SNR 鲁棒性分析 — 新增 "Robustness Under SNR Estimation Errors" 小节，含实验数据表格
+  6. 合并 RML2016.10a/10b 结果 — 合并为一个表格展示，删除 RML2018.10a 和 RML2022.01a 相关内容（星座图、时域图等）
+  7. 更新研究主题 — 引言中加入认知无线电SNR估计场景的描述
+  8. 消融实验改用 IQFormer — 替换原来的 Complex-ResNet 数据
+  9. 生成 IQFormer SNR 准确率对比图 — figure/snr_accuracy/iqformer_snr_accuracy.png
+
+  参考文献 (references.bib): 添加了 FEA-T 和 IQFormer 的引用
+
+  待完成事项
+
+  1. 推理时间 Benchmark — Table V 中 IQFormer/AMC-Net/FEA-T 的 Parameters/FLOPs/Per-Sample Time 标记为 TODO，ULCNN/MCLDNN/PETCGDNN
+  的推理时间也需要在当前硬件重新测试。需要使用 src/model_benchmark.py 对所有模型进行 benchmark（但该脚本目前仅支持 Keras 模型，PyTorch 模型如 IQFormer/FEA-T
+  需要额外处理）。
+  2. RML2016.10b 缺少部分结果 — ULCNN/MCLDNN/PETCGDNN 在 2016b 上的结果使用了原论文数据（output_2016b 中无这三个模型的评估结果）。如需一致性，可能需要重新训练评估。
+  3. PETCGDNN 2016.10a GPR 结果差异 — 原论文为 63.28%，当前 output 目录中为 62.46%，我使用了 output 目录数据。请确认是否需要调整。
+  4. 篇幅调整 — 论文目前仍较长，后续需根据 CL/WCL 快报页数限制进行删减。
+
+
+  已完成
+                                                                                                                                                             
+  1. PETCGDNN +GPR 精度 — 已调整为 63.28%                                                                                                                                 
+  2. Benchmark 代码修改 (src/model_benchmark.py):                                                                                                                         
+    - 添加 PyTorch 模型支持（torch.no_grad() 推理 + torch.cuda.synchronize() 精确计时）                                                                                   
+    - 添加 --model_name 参数（按名称构建模型，无需权重文件）                                                                                                              
+    - 添加 --batch_all 模式（一键测试全部 6 个论文模型）                                                                                                               
+  3. Benchmark 实测结果（RTX 3090, batch_size=256, 22000 samples）:
+
+  | Model         | Parameters | Per-Sample Time (ms) |
+  |---------------|------------|----------------------|
+  | AMC-Net       | 467,112    | 1.554                |
+  | IQFormer      | 355,049    | 0.031                |
+  | MCLDNN        | 405,175    | 1.868                |
+  | FEA-T         | 169,867    | 0.021                |
+  | PETCGDNN      | 71,871     | 0.664                |
+  | ULCNN         | 9,751      | 0.276                |
+  | GPR Denoising | --         | 0.0125               |
+
+  4. 论文效率表已更新 — 移除了 FLOPs 列（Keras/PyTorch 框架间 FLOPs 估算方法不一致），保留 Parameters 和 Per-Sample Time，添加了框架差异说明脚注。
+
+  注意：PyTorch 模型（IQFormer、FEA-T）推理速度显著快于 Keras 模型，这是因为 torch.no_grad() 的 GPU batch 推理效率高于 Keras model.predict() 的 Python 级开销。
+
+
+  GPR 去噪加速分析                                                                                                                                                        
+                                                                                                                                                                          
+  当前实现（efficient_gpr_per_sample.py，纯 NumPy/CPU）的核心瓶颈：                                                                                                       
+                                                                                                                                                                          
+  spectral_gp_denoise_same_inputs():                                                                                                                                      
+    V  = Q^T @ Y     ← (128,128) @ (128, ~22000)  矩阵乘法                                                                                                                
+    S  = Λ/(Λ+σ²)    ← 逐元素                                                                                                                                             
+    G  = S * V        ← 逐元素                                                                                                                                         
+    MU = Q @ G        ← (128,128) @ (128, ~22000)  矩阵乘法
+
+  2.74s 的开销大致分布：
+
+  ┌────────────────────────────────────────────────────┬──────────┐
+  │                        部分                        │ 耗时估计 │
+  ├────────────────────────────────────────────────────┼──────────┤
+  │ Python for 循环逐样本计算功率（175-186行，22万次） │ ~0.8s    │
+  ├────────────────────────────────────────────────────┼──────────┤
+  │ 20 个 SNR 组 × 2 次矩阵乘法                        │ ~1.2s    │
+  ├────────────────────────────────────────────────────┼──────────┤
+  │ 数据格式转换、数组拼接拆分                         │ ~0.5s    │
+  ├────────────────────────────────────────────────────┼──────────┤
+  │ 特征分解（20 × 128³）                              │ ~0.1s    │
+  └────────────────────────────────────────────────────┴──────────┘
+
+  可加速方案：
+
+  1. 向量化 Python for 循环（零成本，立即可做）
+
+  当前第175-186行是逐样本 for 循环计算功率，可以一行向量化：
+  # 替换 for i in range(M): ...
+  pwr = np.mean(stacked[:, 0, :]**2 + stacked[:, 1, :]**2, axis=1)  # (M,)
+  sigmas = np.sqrt(pwr / (2 * (10**(snr_db/10) + 1)))
+  预计节省 ~0.8s（约 30% 的总时间）。
+
+  2. CUDA 加速矩阵运算（最大收益）
+
+  两次矩阵乘法 (128,128) @ (128, 22000) 在 GPU 上是微不足道的运算：
+  import torch
+  Q_gpu = torch.from_numpy(eigvecs).float().cuda()
+  Y_gpu = torch.from_numpy(Y).float().cuda()
+  V = Q_gpu.T @ Y_gpu
+  G = S_gpu * V
+  MU = Q_gpu @ G
+  result = MU.cpu().numpy()
+  GPU matmul 预计 <0.05s（vs CPU ~1.2s），但 CPU↔GPU 数据传输约 0.1-0.2s。
+
+  3. 使用 float32 代替 float64
+
+  当前全程用 float64。GPR 去噪不需要双精度，改 float32 可让 NumPy CPU 运算快约 2 倍，GPU 运算快约 4-8 倍。
+
+  预估加速效果：
+
+  ┌─────────────────────┬────────┬────────────┬──────────┐
+  │        方案         │ 总耗时 │ Per-sample │   改善   │
+  ├─────────────────────┼────────┼────────────┼──────────┤
+  │ 当前（CPU float64） │ 2.74s  │ 0.013ms    │ baseline │
+  ├─────────────────────┼────────┼────────────┼──────────┤
+  │ +向量化 for 循环    │ ~1.9s  │ 0.009ms    │ 1.4×     │
+  ├─────────────────────┼────────┼────────────┼──────────┤
+  │ +float32            │ ~1.2s  │ 0.005ms    │ 2.3×     │
+  ├─────────────────────┼────────┼────────────┼──────────┤
+  │ +CUDA 矩阵运算      │ ~0.3s  │ 0.001ms    │ 9×       │
+  ├─────────────────────┼────────┼────────────┼──────────┤
+  │ 全部优化            │ ~0.2s  │ 0.001ms    │ 14×      │
+  └─────────────────────┴────────┴────────────┴──────────┘
+
+  结论：CUDA 加速完全可行且效果显著。最简单的改法是方案1（向量化循环）+ 方案3（float32），不需要任何额外依赖就能把时间砍掉一半以上。如果加上 CUDA，可以到 ~0.2s 级别。
+
+
