@@ -16,7 +16,7 @@ REPO = '/content/radioML-v4b'; SRC = f'{REPO}/src'
 sys.path.insert(0, SRC); os.chdir(SRC)
 DRIVE = '/content/drive/MyDrive'
 HDF5 = os.environ.get('HDF5_PATH', '/content/rml2018/GOLD_XYZ_OSC.0001_1024.hdf5')
-OUT_ROOT = f'{DRIVE}/results_rml2018'
+OUT_ROOT = os.environ.get('OUT_ROOT', f'{DRIVE}/results_rml2018')   # 可配->同数据换模型(如pet)不与cnn2d结果冲突
 os.makedirs(OUT_ROOT, exist_ok=True)
 
 import tensorflow as tf
@@ -91,7 +91,8 @@ def main():
     log(f'using L0={L0}')
     run_variant(dataset, 'baseline_none', False, L0)
     run_variant(dataset, f'denoise_L{L0:g}', True, L0, 'label')
-    run_variant(dataset, f'denoise_L{L0:g}_spectral', True, L0, 'spectral')
+    if os.environ.get('RUN_SPECTRAL', '1') == '1':                  # PET确认run可关掉省一次训练
+        run_variant(dataset, f'denoise_L{L0:g}_spectral', True, L0, 'spectral')
     log('=== ALL DONE ===')
 
 
