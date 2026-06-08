@@ -152,6 +152,56 @@ def load_data(file_path):
     return data
 
 
+# RML2018.01A 官方类别顺序(HDF5 中 Y one-hot 的列顺序, 即 pinxau1000 数据集的 "Original" 列)
+RML2018_MODS_ORIGINAL = [
+    '32PSK', '16APSK', '32QAM', 'FM', 'GMSK', '32APSK', 'OQPSK', '8ASK', 'BPSK', '8PSK',
+    'AM-SSB-SC', '4ASK', '16PSK', '64APSK', '128QAM', '128APSK', 'AM-DSB-SC', 'AM-SSB-WC',
+    '64QAM', 'QPSK', '256QAM', 'AM-DSB-WC', 'OOK', '16QAM',
+]
+
+
+def load_rml2018_hdf5(file_path, snrs=None, mods=None, per_group=None, seed=42):
+    """加载 RML2018.01A (GOLD_XYZ_OSC.0001_1024.hdf5) -> dict {(mod,snr):(N,2,1024)} (2016格式)。
+
+    HDF5 结构: X=(2555904,1024,2) float, Y=(.,24) one-hot, Z=(.,1) SNR。
+    内存友好: 先全量读小的 Y/Z(~250MB), 按组挑索引(可子采样), 再用 h5py 按排序索引切片读 X。
+    转成 (N,2,1024) 统一2016格式, 直接喂给现有 pipeline(_collect_dataset_arrays/去噪/模型)。
+
+    Args:
+        snrs: 仅保留这些 SNR(None=全部 -20..30, 2dB步长)
+        mods: 仅保留这些调制名(None=全部24类)
+        per_group: 每个(mod,snr)组最多取多少帧(None=全部4096; 子采样加速/省内存)
+    """
+    import h5py
+    rng = np.random.default_rng(seed)
+    with h5py.File(file_path, 'r') as f:
+        Y = f['Y'][:]                         # (N,24) one-hot
+        Z = f['Z'][:].reshape(-1)             # (N,) SNR
+        mod_idx_all = np.argmax(Y, axis=1)    # (N,)
+        X_ds = f['X']                          # 不全读, 按需切片
+
+        sel_snrs = sorted(set(Z.astype(int))) if snrs is None else sorted(snrs)
+        keep_mod_ids = range(24) if mods is None else [RML2018_MODS_ORIGINAL.index(m) for m in mods]
+
+        # 先收集每组要的(全局)索引
+        groups = {}
+        for mi in keep_mod_ids:
+            mod_name = RML2018_MODS_ORIGINAL[mi]
+            for snr in sel_snrs:
+                idx = np.where((mod_idx_all == mi) & (Z.astype(int) == int(snr)))[0]
+                if len(idx) == 0:
+                    continue
+                if per_group is not None and len(idx) > per_group:
+                    idx = rng.choice(idx, per_group, replace=False)
+                groups[(mod_name, int(snr))] = np.sort(idx)
+
+        dataset = {}
+        for key, idx in groups.items():
+            x = X_ds[idx]                      # (g,1024,2) h5py 切片
+            dataset[key] = np.transpose(x, (0, 2, 1)).astype(np.float32)  # -> (g,2,1024)
+    return dataset
+
+
 def augment_iq_data(X_data, theta_rad):
     """
     Augment I/Q data by rotating the I and Q channels.
