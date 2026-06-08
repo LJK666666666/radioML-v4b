@@ -31,14 +31,19 @@ def log(m): LOG.write(m + '\n'); LOG.flush(); print(m, flush=True)
 
 
 def add_diff_channels(dataset):
-    """dict {(mod,snr):(N,2,128)} -> (N,4,128): [Re(y),Im(y),Re(z),Im(z)], z[n]=y[n]·conj(y[n-1])."""
-    out = {}
+    """dict {(mod,snr):(N,2,128)} -> (N,4,128): [Re(y),Im(y),Re(z),Im(z)], z[n]=y[n]·conj(y[n-1])。
+    差分通道Re(z)≈|y|²有大DC分量、尺度与原始I/Q不匹配->必须逐通道全局标准化, 否则cnn2d饱和卡随机。"""
+    tmp = {}
     for k, X in dataset.items():
         y = X[:, 0, :] + 1j * X[:, 1, :]            # (N,128)
         z = np.zeros_like(y)
         z[:, 1:] = y[:, 1:] * np.conj(y[:, :-1])
-        out[k] = np.stack([X[:, 0, :], X[:, 1, :], z.real, z.imag], axis=1).astype(np.float32)
-    return out
+        tmp[k] = np.stack([X[:, 0, :], X[:, 1, :], z.real, z.imag], axis=1).astype(np.float32)
+    cat = np.concatenate(list(tmp.values()), axis=0)        # (M,4,128)
+    mean = cat.mean(axis=(0, 2), keepdims=True)             # (1,4,1) 逐通道
+    std = cat.std(axis=(0, 2), keepdims=True) + 1e-6
+    del cat
+    return {k: ((v - mean) / std).astype(np.float32) for k, v in tmp.items()}
 
 
 def run_variant(dataset, name):
