@@ -78,6 +78,22 @@ DATASET_CONFIGS = {
         'file_suffix_prefix': '_2016b',
         'dataset_label': 'RML2016.10b',
     },
+    # RML22 (samples_per_symbol=8, 来自 RML22/ 仓库自定义生成); 与 2016a 同为 dict 格式 (2,128)
+    'rml22': {
+        'dataset_path': '../data/RML22',
+        'output_dir': '../output_rml22',
+        'denoised_cache_dir': '../denoised_datasets_rml22',
+        'file_suffix_prefix': '_rml22',
+        'dataset_label': 'RML22',
+    },
+    # RML22.01A (samples_per_symbol=2, 官方); 低过采样, 去噪需用 Wiener 核(见 denoising_method)
+    'rml22.01a': {
+        'dataset_path': '../data/RML22.01A',
+        'output_dir': '../output_rml2201a',
+        'denoised_cache_dir': '../denoised_datasets_rml2201a',
+        'file_suffix_prefix': '_rml2201a',
+        'dataset_label': 'RML22.01A',
+    },
 }
 
 
