@@ -24,9 +24,13 @@ def estimate_noise_std(signal_power: float, snr_db: float) -> float:
     return float(np.sqrt(noise_power / 2))
 
 
-def length_scale_from_snr(snr_db: float) -> float:
-    # 与 origin.py 相同
-    return 5.0 if snr_db >= 0 else (5.0 - snr_db * 0.25)
+def length_scale_from_snr(snr_db: float, L0: float = 5.0, slope: float = 0.25) -> float:
+    # 默认 (L0=5.0, slope=0.25) 与 origin.py 完全一致: SNR>=0 时 L=L0; SNR<0 时 L=L0-snr*slope (随SNR下降而增大)
+    # slope 可为负 -> 低SNR时 L 反而缩小(用户提到的"负β")。加下限避免退化。
+    if snr_db >= 0:
+        return float(L0)
+    L = L0 - snr_db * slope
+    return float(max(L, 0.1))
     # return 5.0/4 if snr_db >= 0 else (5.0 - snr_db * 0.25)/4
     # return 10.0
 
@@ -130,11 +134,19 @@ def group_by_snr_and_length(dataset: Dict[Tuple[str, int], np.ndarray]) -> Dict[
 def apply_gpr_denoising_efficient_per_sample(
     dataset: Dict[Tuple[str, int], np.ndarray],
     batch_limit: int = 4096,      # 控制单次列数，防止极端情况下内存峰值
-    use_cuda: bool = False         # 是否使用CUDA加速矩阵运算
+    use_cuda: bool = False,        # 是否使用CUDA加速矩阵运算
+    L0: float = 5.0,               # 长度尺度基准(SNR>=0时的L)
+    slope: float = 0.25,           # 低SNR时L的增长斜率(每dB), 可为负
+    sigma_f_mode: str = 'unit'     # 'unit'=核无σ_f²(谱滤波Λ/(Λ+σ_n²)); 'signal_var'=σ_f²取信号方差(eff_noise=1/SNR_lin)
 ) -> Tuple[Dict[Tuple[str, int], np.ndarray], float]:
     """
     per-sample模式GPR去噪：谱分解一次，样本级噪声方差 σ_i^2 用谱域缩放
     返回 (denoised_dataset, total_time)
+
+    超参数(默认值复现论文部署律):
+    - L0/slope: 长度尺度 L(snr)=length_scale_from_snr(snr,L0,slope)
+    - sigma_f_mode: 'unit' 核单位方差; 'signal_var' 核乘信号方差 σ_f² -> 等效谱滤波 Λ/(Λ+σ_n²/σ_f²),
+      其中 σ_n²/σ_f²=1/SNR_lin (与每样本测得功率无关, 组内常数)。
 
     支持两种数据格式：
     - 2016格式: dataset[key] 形状: (num_samples, 2, n)
@@ -179,7 +191,7 @@ def apply_gpr_denoising_efficient_per_sample(
 
         # 拼接为统一格式 (M, 2, n) 或 (M, n, 2)
         stacked = np.concatenate([s for _, s in entries], axis=0)
-        ls = length_scale_from_snr(float(snr_db))
+        ls = length_scale_from_snr(float(snr_db), L0=L0, slope=slope)
         K = rbf_kernel_same_grid(n, ls)
 
         print(f'- 处理 SNR={snr_db}dB, n={n}, 合计样本: {total_in_group}, 模块组合数: {len(entries)}')
@@ -198,7 +210,12 @@ def apply_gpr_denoising_efficient_per_sample(
         else:
             # stacked: (M, n, 2)
             pwr = np.mean(stacked[:, :, 0] ** 2 + stacked[:, :, 1] ** 2, axis=1)  # (M,)
-        noise_vars_samples = (pwr / (2.0 * (snr_linear + 1.0))).astype(np.float32)  # σ_n^2, (M,)
+        if sigma_f_mode == 'signal_var':
+            # σ_f²=信号方差 -> 等效噪声 σ_n²/σ_f² = 1/SNR_lin (组内常数, 与测得功率无关)
+            noise_vars_samples = np.full((M,), 1.0 / snr_linear, dtype=np.float32)
+        else:
+            # 'unit': 核单位方差, 谱滤波 Λ/(Λ+σ_n²)
+            noise_vars_samples = (pwr / (2.0 * (snr_linear + 1.0))).astype(np.float32)  # σ_n^2, (M,)
 
         # 构造 Y（float32）与每列噪声方差
         Y = np.empty((n, M * 2), dtype=np.float32)
@@ -254,7 +271,8 @@ def apply_gpr_denoising_efficient_per_sample(
     return denoised_dataset, total_time
 
 
-def apply_efficient_gpr_denoising_per_sample(X_all, y_all, snr_values_all, mods=None):
+def apply_efficient_gpr_denoising_per_sample(X_all, y_all, snr_values_all, mods=None,
+                                             L0=5.0, slope=0.25, sigma_f_mode='unit'):
     """
     Apply efficient GPR denoising using per-sample mode.
     This function reorganizes data by (modulation, SNR) and calls the per-sample GPR implementation.
@@ -264,6 +282,7 @@ def apply_efficient_gpr_denoising_per_sample(X_all, y_all, snr_values_all, mods=
         y_all: Labels (integer indices)
         snr_values_all: SNR values for each sample
         mods: List of modulation names (if None, will create generic names)
+        L0, slope, sigma_f_mode: GPR 超参数 (默认复现论文部署律, 见 apply_gpr_denoising_efficient_per_sample)
     """
     # Get modulation types from y_all (assuming integer labels)
     unique_mod_indices = np.unique(y_all)
@@ -293,7 +312,8 @@ def apply_efficient_gpr_denoising_per_sample(X_all, y_all, snr_values_all, mods=
     # Apply per-sample GPR denoising
     denoised_dataset, processing_time = apply_gpr_denoising_efficient_per_sample(
         dataset,
-        batch_limit=4096
+        batch_limit=4096,
+        L0=L0, slope=slope, sigma_f_mode=sigma_f_mode
     )
 
     # Reorganize denoised data back to the original format
