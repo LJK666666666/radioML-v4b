@@ -20,8 +20,8 @@ DRIVE = '/content/drive/MyDrive'
 DATA = f'{DRIVE}/RML22'
 OUT_ROOT = f'{DRIVE}/results_rml22_original'
 EPOCHS = int(os.environ.get('EPOCHS', '80'))
-# 先放 cnn1d 作快速 sanity(轻量Keras),再 6 个论文模型
-MODELS = ['cnn1d', 'ulcnn', 'mcldnn', 'pet', 'amcnet', 'fea_t', 'iqformer']
+# 论文 6 模型(按快->慢排序,让结果尽早出)
+MODELS = ['ulcnn', 'pet', 'mcldnn', 'amcnet', 'fea_t', 'iqformer']
 
 os.makedirs(OUT_ROOT, exist_ok=True)
 LOG = open(f'{OUT_ROOT}/run.log', 'a')
