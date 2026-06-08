@@ -62,15 +62,16 @@ VARIANTS = [
     ('L6_s0.25_sigf',   True,  6.0,  0.25, 'signal_var', 'rbf'),
 ]
 
-# Round-2(Matern保边沿 + σ_f²温和去噪, 针对 ULCNN 等"去噪反伤高频"模型的 do-no-harm):
-# 用 SEARCH_ROUND=2 启动。最终 L0/sigma_f 组合可据 round-1 结果再调。
+# Round-2: 针对"RML22低SNR标签实际SNR高8~13dB(标定不同),标签估噪->过平滑"的对症修正。
+# 核心=spectral自校准噪声估计(从高频谱底实测真噪声,不依赖标签) + Matern保边。用 SEARCH_ROUND=2 启动。
+# (name, denoise?, L0, slope, sigma_f_mode, kernel, noise_est)
 ROUND2_VARIANTS = [
-    ('baseline_none',     False, None, None, None,        'rbf'),       # 复用(已DONE则跳过)
-    ('mat32_L5_s0.25',    True,  5.0,  0.25, 'unit',       'matern32'),  # Matern保边, 标准L
-    ('mat32_L3_s0.25',    True,  3.0,  0.25, 'unit',       'matern32'),  # 更小L更保边
-    ('mat32_L5_s0.25_sigf',True, 5.0,  0.25, 'signal_var', 'matern32'),  # Matern+σ_f²门控
-    ('mat32_L7_s0.25',    True,  7.0,  0.25, 'unit',       'matern32'),
-    ('rbf_L3_s0.25_sigf', True,  3.0,  0.25, 'signal_var', 'rbf'),       # RBF小L+σ_f²(更温和)
+    ('baseline_none',     False, None, None, None,  'rbf',      'label'),     # 复用(已DONE则跳过)
+    ('spec_L5_s0.25',     True,  5.0,  0.25, 'unit', 'rbf',      'spectral'),  # ★自校准噪声: 修正过平滑(do-no-harm)
+    ('spec_L3_s0.25',     True,  3.0,  0.25, 'unit', 'rbf',      'spectral'),  # 自校准+更小L(更保信号)
+    ('spec_L5_mat32',     True,  5.0,  0.25, 'unit', 'matern32', 'spectral'),  # ★自校准+Matern保边(最gentle组合)
+    ('mat32_L5_s0.25',    True,  5.0,  0.25, 'unit', 'matern32', 'label'),     # 仅Matern保边(对照)
+    ('mat32_L3_s0.25',    True,  3.0,  0.25, 'unit', 'matern32', 'label'),     # Matern+小L
 ]
 if os.environ.get('SEARCH_ROUND', '1') == '2':
     VARIANTS = ROUND2_VARIANTS
@@ -80,7 +81,7 @@ def log(m):
     LOG.write(m + '\n'); LOG.flush(); print(m, flush=True)
 
 
-def run_variant(dataset, name, denoise, L0, slope, sigma_f_mode, kernel='rbf'):
+def run_variant(dataset, name, denoise, L0, slope, sigma_f_mode, kernel='rbf', noise_est='label'):
     vdir = f'{OUT_ROOT}/{name}'
     done = f'{vdir}/DONE.txt'
     if os.path.exists(done):
@@ -93,9 +94,9 @@ def run_variant(dataset, name, denoise, L0, slope, sigma_f_mode, kernel='rbf'):
     t0 = time.time()
     # 去噪(dict版函数不修改输入 dict)
     if denoise:
-        log(f'>>> {name}: denoise kernel={kernel} L0={L0} slope={slope} sigma_f={sigma_f_mode}')
+        log(f'>>> {name}: denoise kernel={kernel} L0={L0} slope={slope} sigma_f={sigma_f_mode} noise_est={noise_est}')
         dn_dict, dt = apply_gpr_denoising_efficient_per_sample(
-            dataset, L0=L0, slope=slope, sigma_f_mode=sigma_f_mode, kernel=kernel)
+            dataset, L0=L0, slope=slope, sigma_f_mode=sigma_f_mode, kernel=kernel, noise_est=noise_est)
         log(f'    denoise done ({dt:.0f}s)')
     else:
         dn_dict = dataset
@@ -117,8 +118,8 @@ def run_variant(dataset, name, denoise, L0, slope, sigma_f_mode, kernel='rbf'):
                                models_dir, results_dir, suffix, results_suffix=suffix)
 
     json.dump({'name': name, 'denoise': denoise, 'L0': L0, 'slope': slope,
-               'sigma_f_mode': sigma_f_mode, 'kernel': kernel, 'epochs': SEARCH_EPOCHS,
-               'elapsed_s': time.time() - t0},
+               'sigma_f_mode': sigma_f_mode, 'kernel': kernel, 'noise_est': noise_est,
+               'epochs': SEARCH_EPOCHS, 'elapsed_s': time.time() - t0},
               open(f'{vdir}/variant.json', 'w'), indent=2)
     open(done, 'w').write(f'{time.time() - t0:.0f}s')
     log(f'DONE  {name} ({time.time() - t0:.0f}s)')

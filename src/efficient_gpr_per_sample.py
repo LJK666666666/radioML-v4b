@@ -154,7 +154,8 @@ def apply_gpr_denoising_efficient_per_sample(
     L0: float = 5.0,               # 长度尺度基准(SNR>=0时的L)
     slope: float = 0.25,           # 低SNR时L的增长斜率(每dB), 可为负
     sigma_f_mode: str = 'unit',    # 'unit'=核无σ_f²(谱滤波Λ/(Λ+σ_n²)); 'signal_var'=σ_f²取信号方差(eff_noise=1/SNR_lin)
-    kernel: str = 'rbf'            # 'rbf'(默认,无穷可导) 或 'matern32'(一阶可导,保边沿)
+    kernel: str = 'rbf',           # 'rbf'(默认,无穷可导) 或 'matern32'(一阶可导,保边沿)
+    noise_est: str = 'label'       # 'label'=σ_n²从SNR标签估(默认); 'spectral'=从每样本高频谱底实测(自校准,不依赖标签)
 ) -> Tuple[Dict[Tuple[str, int], np.ndarray], float]:
     """
     per-sample模式GPR去噪：谱分解一次，样本级噪声方差 σ_i^2 用谱域缩放
@@ -227,7 +228,18 @@ def apply_gpr_denoising_efficient_per_sample(
         else:
             # stacked: (M, n, 2)
             pwr = np.mean(stacked[:, :, 0] ** 2 + stacked[:, :, 1] ** 2, axis=1)  # (M,)
-        if sigma_f_mode == 'signal_var':
+        if noise_est == 'spectral':
+            # 数据驱动: 从每样本高频谱底直接估真实噪声(不依赖SNR标签)。
+            # 动机: RML22低SNR标签下实际SNR比2016a高8~13dB(标定方式不同),用标签估σ_n²会高估->过平滑。
+            # spS过采样信号占低频, FFT中间半带(N/4~3N/4)≈纯噪声; σ_n²(每实分量)=mean|FFT[noise]|²/n/2。
+            if data_format_2016:
+                xc = stacked[:, 0, :] + 1j * stacked[:, 1, :]   # (M, n)
+            else:
+                xc = stacked[:, :, 0] + 1j * stacked[:, :, 1]
+            Pf = np.abs(np.fft.fft(xc, axis=1)) ** 2            # (M, n)
+            nb = np.arange(n // 4, 3 * n // 4)
+            noise_vars_samples = (np.mean(Pf[:, nb], axis=1) / n / 2.0).astype(np.float32)
+        elif sigma_f_mode == 'signal_var':
             # σ_f²=信号方差 -> 等效噪声 σ_n²/σ_f² = 1/SNR_lin (组内常数, 与测得功率无关)
             noise_vars_samples = np.full((M,), 1.0 / snr_linear, dtype=np.float32)
         else:
@@ -289,7 +301,8 @@ def apply_gpr_denoising_efficient_per_sample(
 
 
 def apply_efficient_gpr_denoising_per_sample(X_all, y_all, snr_values_all, mods=None,
-                                             L0=5.0, slope=0.25, sigma_f_mode='unit', kernel='rbf'):
+                                             L0=5.0, slope=0.25, sigma_f_mode='unit', kernel='rbf',
+                                             noise_est='label'):
     """
     Apply efficient GPR denoising using per-sample mode.
     This function reorganizes data by (modulation, SNR) and calls the per-sample GPR implementation.
@@ -330,7 +343,7 @@ def apply_efficient_gpr_denoising_per_sample(X_all, y_all, snr_values_all, mods=
     denoised_dataset, processing_time = apply_gpr_denoising_efficient_per_sample(
         dataset,
         batch_limit=4096,
-        L0=L0, slope=slope, sigma_f_mode=sigma_f_mode, kernel=kernel
+        L0=L0, slope=slope, sigma_f_mode=sigma_f_mode, kernel=kernel, noise_est=noise_est
     )
 
     # Reorganize denoised data back to the original format
