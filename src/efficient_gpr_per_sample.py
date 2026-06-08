@@ -45,6 +45,22 @@ def rbf_kernel_same_grid(n: int, length_scale: float) -> np.ndarray:
     return K
 
 
+def matern32_kernel_same_grid(n: int, length_scale: float) -> np.ndarray:
+    # Matern-3/2: K=(1+√3 d/L)exp(-√3 d/L), 仅一阶可导 -> 保留尖锐边沿(PSK相位跳变/QAM幅度台阶),
+    # 比 RBF(无穷可导,过度平滑)更利低过采样/对去噪敏感的复值模型(如 ULCNN)。单位方差。
+    idx = np.arange(n, dtype=np.float64)
+    d = np.abs(idx[:, None] - idx[None, :])
+    r = np.sqrt(3.0) * d / max(length_scale, 1e-12)
+    K = (1.0 + r) * np.exp(-r)
+    return K
+
+
+def kernel_same_grid(n: int, length_scale: float, kernel: str = 'rbf') -> np.ndarray:
+    if kernel == 'matern32':
+        return matern32_kernel_same_grid(n, length_scale)
+    return rbf_kernel_same_grid(n, length_scale)
+
+
 def spectral_gp_denoise_same_inputs(
     eigvecs: np.ndarray,   # Q (n,n)
     eigvals: np.ndarray,   # Λ (n,)
@@ -137,7 +153,8 @@ def apply_gpr_denoising_efficient_per_sample(
     use_cuda: bool = False,        # 是否使用CUDA加速矩阵运算
     L0: float = 5.0,               # 长度尺度基准(SNR>=0时的L)
     slope: float = 0.25,           # 低SNR时L的增长斜率(每dB), 可为负
-    sigma_f_mode: str = 'unit'     # 'unit'=核无σ_f²(谱滤波Λ/(Λ+σ_n²)); 'signal_var'=σ_f²取信号方差(eff_noise=1/SNR_lin)
+    sigma_f_mode: str = 'unit',    # 'unit'=核无σ_f²(谱滤波Λ/(Λ+σ_n²)); 'signal_var'=σ_f²取信号方差(eff_noise=1/SNR_lin)
+    kernel: str = 'rbf'            # 'rbf'(默认,无穷可导) 或 'matern32'(一阶可导,保边沿)
 ) -> Tuple[Dict[Tuple[str, int], np.ndarray], float]:
     """
     per-sample模式GPR去噪：谱分解一次，样本级噪声方差 σ_i^2 用谱域缩放
@@ -192,7 +209,7 @@ def apply_gpr_denoising_efficient_per_sample(
         # 拼接为统一格式 (M, 2, n) 或 (M, n, 2)
         stacked = np.concatenate([s for _, s in entries], axis=0)
         ls = length_scale_from_snr(float(snr_db), L0=L0, slope=slope)
-        K = rbf_kernel_same_grid(n, ls)
+        K = kernel_same_grid(n, ls, kernel=kernel)
 
         print(f'- 处理 SNR={snr_db}dB, n={n}, 合计样本: {total_in_group}, 模块组合数: {len(entries)}')
 
@@ -272,7 +289,7 @@ def apply_gpr_denoising_efficient_per_sample(
 
 
 def apply_efficient_gpr_denoising_per_sample(X_all, y_all, snr_values_all, mods=None,
-                                             L0=5.0, slope=0.25, sigma_f_mode='unit'):
+                                             L0=5.0, slope=0.25, sigma_f_mode='unit', kernel='rbf'):
     """
     Apply efficient GPR denoising using per-sample mode.
     This function reorganizes data by (modulation, SNR) and calls the per-sample GPR implementation.
@@ -313,7 +330,7 @@ def apply_efficient_gpr_denoising_per_sample(X_all, y_all, snr_values_all, mods=
     denoised_dataset, processing_time = apply_gpr_denoising_efficient_per_sample(
         dataset,
         batch_limit=4096,
-        L0=L0, slope=slope, sigma_f_mode=sigma_f_mode
+        L0=L0, slope=slope, sigma_f_mode=sigma_f_mode, kernel=kernel
     )
 
     # Reorganize denoised data back to the original format
