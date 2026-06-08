@@ -275,6 +275,32 @@ def predict_probs(model, X, device, batch_size=512):
 # 输出目录
 # ============================================================================
 
+def build_model(name, input_shape, num_classes):
+    """统一模型注册分发(论文6架构的PyTorch版)。forward均接收(B,2,128)->logits。"""
+    if name == 'pet':
+        from model.pet_torch_model import build_pet_torch
+        return build_pet_torch(input_shape, num_classes)
+    if name == 'ulcnn':
+        from model.ulcnn_torch_model import build_ulcnn_torch_model
+        return build_ulcnn_torch_model(input_shape, num_classes)
+    if name == 'fea_t':
+        from model.fea_t_torch_model import build_fea_t_model
+        return build_fea_t_model(input_shape, num_classes)
+    if name == 'iqformer':
+        from model.iqformer_torch_model import build_iqformer_model
+        return build_iqformer_model(input_shape, num_classes)
+    if name == 'mcldnn':
+        from model.mcldnn_torch_model import build_mcldnn_torch_model
+        return build_mcldnn_torch_model(input_shape, num_classes)
+    if name == 'amcnet':
+        from model.amcnet_torch_model import build_amcnet_torch_model
+        return build_amcnet_torch_model(input_shape, num_classes)
+    raise ValueError(f"unknown model: {name}")
+
+
+PAPER_MODELS = ['ulcnn', 'mcldnn', 'pet', 'amcnet', 'fea_t', 'iqformer']
+
+
 def next_run_dir(results_root, base):
     os.makedirs(results_root, exist_ok=True)
     num = 1
